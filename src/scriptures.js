@@ -570,14 +570,24 @@ export function findRelevantScriptures(query, mood = "", maxResults = 5) {
 export function buildScriptureContext(relevantScriptures) {
   if (!relevantScriptures.length) return "";
 
-  const entries = relevantScriptures.map(s =>
-    `[${s.source}]
-Sanskrit: ${s.verse_sanskrit}
-Transliteration: ${s.transliteration}
-Translation: ${s.translation}
-Commentary: ${s.commentary}
-Themes: ${s.themes.join(", ")}`
-  ).join("\n\n---\n\n");
+  const entries = relevantScriptures.map(s => {
+    const source = s.book_name && s.chapter && s.verse_number
+      ? `${s.book_name} ${s.chapter}.${s.verse_number}`
+      : s.source || "Scripture";
 
-  return `\n\nRELEVANT SCRIPTURES FOR THIS QUERY:\n\n${entries}\n\nDraw primarily from these scriptures in your response. Quote them accurately. You may reference other scriptures you know as well.`;
+    const sanskritText = s.sanskrit_text ?? s.verse_sanskrit ?? "";
+    const englishTranslation = s.english_translation ?? s.translation ?? "";
+    const transliteration = s.transliteration ?? "";
+    const commentary = s.commentary ?? "";
+    const themes = Array.isArray(s.themes) ? s.themes : [];
+
+    return `[${source}]
+Sanskrit: ${sanskritText}
+Transliteration: ${transliteration}
+Translation: ${englishTranslation}
+Commentary: ${commentary}
+Themes: ${themes.join(", ")}`;
+  }).join("\n\n---\n\n");
+
+  return `\n\nRETRIEVED SCRIPTURE PASSAGES:\n\n${entries}\n\nDraw primarily from these scriptures in your response. Quote them accurately. If a passage is not relevant, do not force it into the answer.`;
 }
