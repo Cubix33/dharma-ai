@@ -150,11 +150,11 @@ ${scriptureContext}`;
     { role: "user", content: question },
   ];
 
-  const response = await fetch("/xai-api/v1/chat/completions", {
+  const response = await fetch("https://api.x.ai/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${GROK_API_KEY}`,
+      "Authorization": `Bearer ${import.meta.env.VITE_GROK_API_KEY}`,
     },
     body: JSON.stringify({
       model: "grok-4.5",
