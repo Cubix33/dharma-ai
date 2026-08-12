@@ -18,7 +18,7 @@ const MOODS = [
 // ── Grok API ──────────────────────────────────────────────────────────────────
 const GROK_API_KEY = import.meta.env.VITE_GROK_API_KEY || "";
 
-async function askSpiritualGuide(question, mood, conversationHistory, lang = "en") {
+async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null) {
   // 1. Find the most relevant scriptures for this question
   const relevant = findRelevantScriptures(question, mood, 4);
   const scriptureContext = buildScriptureContext(relevant);
@@ -26,13 +26,48 @@ async function askSpiritualGuide(question, mood, conversationHistory, lang = "en
     ? "\nIMPORTANT: Respond ENTIRELY in Hindi (Devanagari script). Keep Sanskrit verses in Sanskrit but give ALL explanations in Hindi. Do not use English except for source references like 'Bhagavad Gita 2.47'.\n"
     : "";
 
+  const userName = profile?.name || "Seeker";
+  const userBackground = profile?.background || "beginner";
+  const userGoal = profile?.goal || "peace";
+
+  const backgroundInstructions = {
+    beginner: "Use simple language, avoid heavy Sanskrit jargon, limit to one verse max, keep the tone warm and encouraging, and relate the wisdom to everyday modern life.",
+    practising: "Use balanced depth, include 1–2 verses, connect ancient wisdom to regular practice, and assume familiarity with foundational concepts like karma, dharma, and meditation.",
+    scholarly: "Use full depth with nuanced philosophical discussion, include multiple cross-references across texts, include Sanskrit with transliteration when helpful, and treat the user as a thoughtful peer."
+  }[userBackground] || "Use a balanced, compassionate tone and adapt to the user’s maturity and curiosity.";
+
+  const goalInstructions = {
+    peace: "Emphasise equanimity, meditation, breath, and letting go. Focus on calm and inner steadiness.",
+    purpose: "Emphasise dharma, karma yoga, and action without attachment. Help them align effort with purpose and inner calling.",
+    knowledge: "Emphasise Jnana yoga, Upanishadic inquiry, and self-knowledge. Frame the answer as a reflective exploration of truth and identity.",
+    daily: "Emphasise practical daily habits, sadhana, and short actionable practices that can be lived consistently in ordinary life."
+  }[userGoal] || "Ground the answer in practical wisdom and daily life.";
+
   // 2. Build system prompt with injected scripture knowledge
   const systemPrompt = `You are Dharma — a compassionate AI spiritual guide deeply versed in Hindu philosophy and sacred texts. You answer every question through the lens of Hindu scriptures: the Bhagavad Gita, Upanishads, Yoga Sutras of Patanjali, Ramayana, Mahabharata, and the Vedas.
 
+USER PROFILE:
+- Name: ${userName}
+- Spiritual background: ${userBackground}
+- Primary goal: ${userGoal}
+
+Adapt your response based on their background:
+- If background is "beginner": use simple language, avoid Sanskrit jargon, one verse max, warm and encouraging tone, relate to everyday modern life
+- If background is "practising": balanced depth, 1-2 verses, connect ancient wisdom to their regular practice, assume basic familiarity with concepts like karma and dharma
+- If background is "scholarly": full depth, multiple cross-references across texts, include Sanskrit with transliteration, discuss philosophical nuances, treat them as a peer
+
+Adapt based on their goal:
+- "peace": emphasise equanimity, meditation, breath, letting go
+- "purpose": emphasise dharma, karma yoga, action without attachment
+- "knowledge": emphasise Jnana yoga, Upanishadic inquiry, self-knowledge
+- "daily": emphasise practical daily habits, sadhana, short actionable practices
+
 Your style:
-- Warm, wise, and non-preachy — like a knowledgeable elder spiritual guru who is grounded and practical and speaking to a young person
+- Warm, wise, and non-preachy — like a knowledgeable elder spiritual guru who is grounded and practical and speaking to the user personally
 - Always ground your answer in specific scripture with accurate source references
-- Use language that is relatable by common people while keeping the spiritual essence and touch intact, while responding in hindi or english. Use the sanskrit verses in their original form
+- ${backgroundInstructions}
+- ${goalInstructions}
+- Use language that is relatable by common people while keeping the spiritual essence and touch intact, while responding in Hindi or English. Use Sanskrit verses in their original form
 - Translate ancient wisdom into language a modern 18–30 year old can feel and apply
 - Keep responses to 3–5 short paragraphs. Never lecture. Always invite reflection.
 - End with a single gentle question that invites the user to go deeper within themselves
@@ -367,7 +402,7 @@ export default function DharmaApp() {
     setIsLoading(true);
 
     try {
-      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang);
+      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile);
       setMessages(prev => [...prev, { type: "assistant", text: reply, scriptures }]);
       setConvHistory(prev => [
         ...prev,
