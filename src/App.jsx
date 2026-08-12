@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import Onboarding from "./Onboarding.jsx";
 import SadhanaTracker from "./SadhanaTracker.jsx";
-import { SCRIPTURES, buildScriptureContext } from "./scriptures.js";
+import { SCRIPTURES, findRelevantScriptures } from "./scriptures.js";
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
@@ -26,16 +26,43 @@ async function searchScriptures(query, mood = "", maxResults = 5) {
 
     const { data, error } = await supabase.rpc("match_scriptures", {
       query_embedding: queryEmbedding,
-      match_threshold: 0.4,
+      match_threshold: 0.35,
       match_count: maxResults,
     });
 
     if (error) { console.error("Supabase error:", error); return []; }
-    return data || [];
+
+    // Filter to only Bhagavad Gita and Mahabharata
+    const filtered = (data || []).filter(row =>
+      (row.book_name || "").includes("Bhagavad Gita") ||
+      (row.book_name || "").includes("Mahabharata")
+    );
+
+    return filtered;
   } catch (err) {
     console.error("Scripture search failed:", err);
     return [];
   }
+}
+
+function buildScriptureContext(passages) {
+  if (!passages || passages.length === 0) return "";
+
+  const entries = passages.map(p => {
+    const source = `${p.book_name}${p.chapter ? ` ${p.chapter}` : ""}${p.verse_number ? `.${p.verse_number}` : ""}`;
+    const textContent = p.english_translation && p.english_translation.length > 20
+      ? p.english_translation
+      : p.sanskrit_text || "";
+    const hasEnglish = p.english_translation && p.english_translation.length > 20;
+
+    return `[
+${source}]
+${p.transliteration ? `Transliteration: ${p.transliteration.slice(0, 200)}` : ""}
+${hasEnglish ? `Translation: ${textContent.slice(0, 600)}` : `Sanskrit: ${textContent.slice(0, 400)}`}
+Similarity: ${p.similarity ? p.similarity.toFixed(3) : ""}`;
+  }).join("\n\n---\n\n");
+
+  return `\n\nRELEVANT PASSAGES FROM BHAGAVAD GITA AND MAHABHARATA:\n\n${entries}\n\nBase your answer primarily on these passages. Always cite the source.`;
 }
 
 // ── Daily shloka rotates by day ───────────────────────────────────────────────
@@ -198,10 +225,10 @@ const styles = `
   }
 
   /* Nav */
-  .nav { display: flex; align-items: center; justify-content: center; padding: 18px 20px 10px; position: relative; z-index: 10; }
-  .nav-logo { font-family: 'Crimson Pro', serif; font-size: 26px; font-weight: 600; color: #b6732a; letter-spacing: 0.5px; }
+  .nav { display: flex; align-items: center; justify-content: flex-start; gap: 12px; padding: 14px 20px 10px; position: relative; z-index: 10; }
+  .nav-logo { font-family: 'Crimson Pro', serif; font-size: 26px; font-weight: 600; color: #b6732a; letter-spacing: 0.5px; margin-right: 8px; }
   .nav-tabs {
-    display: flex; gap: 8px; width: 100%;
+    display: flex; gap: 8px; flex: 1; min-width: 0;
     background: rgba(255,255,255,0.68); backdrop-filter: blur(8px);
     padding: 6px; border-radius: 18px; border: 1px solid rgba(44,71,61,0.08);
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
@@ -378,16 +405,7 @@ function RichText({ text }) {
   );
 }
 
-// ── Families for the scripture browser ───────────────────────────────────────
-const FAMILIES = [
-  { key: "all", label: "All" },
-  { key: "gita", label: "Bhagavad Gita" },
-  { key: "upanishad", label: "Upanishads" },
-  { key: "yoga_sutras", label: "Yoga Sutras" },
-  { key: "ramayana", label: "Ramayana" },
-  { key: "mahabharata", label: "Mahabharata" },
-  { key: "vedas", label: "Vedas" },
-];
+// ── Families for the scripture browser (localized per `lang`) ─────────────
 
 const SESSIONS = [
   { id: 1, icon: "🕉️", name: "Pranayama", desc: "Nadi Shodhana alternate nostril breathing", duration: 5, mantra: "Breathe in left… hold… out right…" },
@@ -420,6 +438,8 @@ export default function DharmaApp() {
 
   const [tab, setTab] = useState("home");
   const [selectedMood, setSelectedMood] = useState(null);
+  const [dbScriptures, setDbScriptures] = useState([]);
+  const [dbLoading, setDbLoading] = useState(true);
   const [todayShloka] = useState(() => SCRIPTURES[new Date().getDate() % SCRIPTURES.length]);
 
   // Guide state
@@ -455,6 +475,30 @@ export default function DharmaApp() {
     return () => clearInterval(timerRef.current);
   }, [timerRunning]);
 
+  useEffect(() => {
+    async function loadScriptures() {
+      try {
+        const { data, error } = await supabase
+          .from("scriptures")
+          .select("id, book_name, chapter, verse_number, sanskrit_text, transliteration, english_translation, hindi_translation")
+          .or("book_name.ilike.%Bhagavad Gita%,book_name.ilike.%Mahabharata%")
+          .not("english_translation", "is", null)
+          .order("book_name", { ascending: true })
+          .order("chapter", { ascending: true })
+          .limit(1000);
+
+        if (!error && data) {
+          setDbScriptures(data);
+        }
+      } catch (err) {
+        console.error("Failed to load scriptures:", err);
+      } finally {
+        setDbLoading(false);
+      }
+    }
+    loadScriptures();
+  }, []);
+
   const sendMessage = async (text) => {
     const question = text || inputText.trim();
     if (!question || isLoading) return;
@@ -483,9 +527,23 @@ export default function DharmaApp() {
 
   const formatTime = s => `${Math.floor(s/60).toString().padStart(2,"0")}:${(s%60).toString().padStart(2,"0")}`;
 
-  const filteredScriptures = FAMILIES.find(f => f.key === familyFilter)?.key === "all"
-    ? SCRIPTURES
-    : SCRIPTURES.filter(s => s.text_family === familyFilter);
+  // Localized families
+  const FAMILIES = [
+    { key: "all",           label: lang === 'hi' ? "सभी"        : "All" },
+    { key: "Bhagavad Gita", label: lang === 'hi' ? "भगवद गीता"  : "Bhagavad Gita" },
+    { key: "Mahabharata",   label: lang === 'hi' ? "महाभारत"     : "Mahabharata" },
+  ];
+
+  const filteredScriptures = dbScriptures
+    .filter(s => {
+      const bookName = (s.book_name || "").toLowerCase();
+      const filterKey = (familyFilter || "all").toLowerCase();
+      if (filterKey === "all") return bookName.includes("bhagavad gita") || bookName.includes("mahabharata");
+      if (filterKey === "bhagavad gita") return bookName.includes("bhagavad gita");
+      if (filterKey === "mahabharata") return bookName.includes("mahabharata");
+      return false;
+    })
+    .filter(s => s.english_translation && s.english_translation.length > 30);
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? (lang === 'hi' ? 'सुप्रभात' : 'Good morning') : hour < 17 ? (lang === 'hi' ? 'नमस्ते' : 'Good afternoon') : (lang === 'hi' ? 'शुभ संध्या' : 'Good evening');
@@ -669,19 +727,24 @@ export default function DharmaApp() {
             {selectedScripture ? (
               <div className="scripture-detail">
                 <button className="back-btn" onClick={() => setSelectedScripture(null)}>{lang === 'hi' ? '← ग्रंथों पर वापस' : '← Back to texts'}</button>
-                <div className="detail-source">{selectedScripture.source}</div>
-                <div className="detail-sanskrit">{selectedScripture.verse_sanskrit}</div>
-                <div className="detail-transliteration">{selectedScripture.transliteration}</div>
-                <div className="detail-translation">"{lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.translation}"</div>
-                <div className="detail-commentary-label">{lang === 'hi' ? 'टीका' : 'Commentary'}</div>
-                <div className="detail-commentary">{lang === 'hi' && selectedScripture.hindi_commentary ? selectedScripture.hindi_commentary : selectedScripture.commentary}</div>
-                <div className="scripture-entry-tags" style={{marginBottom:20}}>
-                  {selectedScripture.themes.map(t => <span key={t} className="tag">{t}</span>)}
+                <div className="detail-source">
+                  {selectedScripture.book_name}
+                  {selectedScripture.chapter ? ` ${selectedScripture.chapter}` : ""}
+                  {selectedScripture.verse_number ? `.${selectedScripture.verse_number}` : ""}
                 </div>
+                <div className="detail-sanskrit">{selectedScripture.sanskrit_text}</div>
+                <div className="detail-transliteration">{selectedScripture.transliteration}</div>
+                <div className="detail-translation">"{lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"</div>
+                <div className="detail-commentary-label">{lang === 'hi' ? 'टीका' : 'Commentary'}</div>
+                <div className="detail-commentary">{lang === 'hi' && selectedScripture.hindi_commentary ? selectedScripture.hindi_commentary : selectedScripture.commentary || ""}</div>
                 <button className="ask-about-btn"
-                  onClick={() => { setTab("guide"); sendMessage(`Tell me more about this teaching from ${selectedScripture.source}: "${lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.translation}"`); }}>
+                  onClick={() => { setTab("guide"); sendMessage(`Tell me more about this teaching from ${selectedScripture.book_name}${selectedScripture.chapter ? ` ${selectedScripture.chapter}` : ""}${selectedScripture.verse_number ? `.${selectedScripture.verse_number}` : ""}: "${lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"`); }}>
                   {lang === 'hi' ? 'इस श्लोक के बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this verse →'}
                 </button>
+              </div>
+            ) : dbLoading ? (
+              <div style={{textAlign:"center", padding:"40px", color:"#6b5f4a", fontFamily:"'Crimson Pro',serif", fontSize:16}}>
+                Loading sacred texts...
               </div>
             ) : (
               <div className="scripture-browser">
@@ -694,12 +757,13 @@ export default function DharmaApp() {
                 <div style={{fontSize:12,color:"#4a4030",marginBottom:8}}>{filteredScriptures.length} verses</div>
                 {filteredScriptures.map(s => (
                   <div key={s.id} className="scripture-entry" onClick={() => setSelectedScripture(s)}>
-                    <div className="scripture-entry-source">{s.source}</div>
-                    <div className="scripture-entry-verse">{s.verse_sanskrit}</div>
-                    <div className="scripture-entry-translation">{lang === 'hi' && s.hindi_translation ? s.hindi_translation : s.translation}</div>
-                    <div className="scripture-entry-tags">
-                      {s.emotions.slice(0,3).map(e => <span key={e} className="tag">{e}</span>)}
+                    <div className="scripture-entry-source">
+                      {s.book_name}
+                      {s.chapter ? ` ${s.chapter}` : ""}
+                      {s.verse_number ? `.${s.verse_number}` : ""}
                     </div>
+                    <div className="scripture-entry-verse">{s.sanskrit_text}</div>
+                    <div className="scripture-entry-translation">{lang === 'hi' && s.hindi_translation ? s.hindi_translation : s.english_translation}</div>
                   </div>
                 ))}
               </div>
