@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import Onboarding from "./Onboarding.jsx";
 import SadhanaTracker from "./SadhanaTracker.jsx";
+import ShareCard from "./ShareCard.jsx";
 import { SCRIPTURES, findRelevantScriptures } from "./scriptures.js";
 
 const supabase = createClient(
@@ -15,8 +16,9 @@ const openaiClient = new OpenAI({
   dangerouslyAllowBrowser: true,
 });
 
-async function searchScriptures(query, mood = "", maxResults = 5) {
+async function searchScriptures(query, mood = "", maxResults = 10) {
   const searchText = mood ? `${query} feeling ${mood}` : query;
+
   try {
     const embeddingResponse = await openaiClient.embeddings.create({
       model: "text-embedding-3-small",
@@ -24,45 +26,178 @@ async function searchScriptures(query, mood = "", maxResults = 5) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    const { data, error } = await supabase.rpc("match_scriptures", {
-      query_embedding: queryEmbedding,
-      match_threshold: 0.35,
-      match_count: maxResults,
-    });
+    const q = (query + " " + mood).toLowerCase();
+    const mentionsGita = q.includes("gita") || q.includes("bhagavad") ||
+                         q.includes("krishna") || q.includes("arjuna");
+    const mentionsMB   = q.includes("mahabharata") || q.includes("mahabharat") ||
+                         q.includes("parva");
 
-    if (error) { console.error("Supabase error:", error); return []; }
+    let results = [];
 
-    // Filter to only Bhagavad Gita and Mahabharata
-    const filtered = (data || []).filter(row =>
-      (row.book_name || "").includes("Bhagavad Gita") ||
-      (row.book_name || "").includes("Mahabharata")
-    );
+    if (mentionsGita && !mentionsMB) {
+      // Search ONLY within Bhagavad Gita — fast because pre-filtered
+      const { data, error } = await supabase.rpc("match_scriptures_filtered", {
+        query_embedding: queryEmbedding,
+        filter_book:     "Bhagavad Gita",
+        match_threshold: 0.2,
+        match_count:     10,
+      });
+      if (error) console.error("Gita search error:", error);
+      results = data || [];
+      console.log("Gita-only search:", results.length, "results");
 
-    return filtered;
+    } else if (mentionsMB && !mentionsGita) {
+      // Search ONLY within Mahabharata English (not Critical Edition)
+      const { data, error } = await supabase.rpc("match_scriptures_filtered", {
+        query_embedding: queryEmbedding,
+        filter_book:     "Mahabharata —",
+        match_threshold: 0.2,
+        match_count:     10,
+      });
+      if (error) console.error("MB search error:", error);
+      results = data || [];
+      console.log("Mahabharata search:", results.length, "results");
+
+    } else {
+      // General emotional/philosophical query
+      // Use combined function that pre-filters to Gita + Mahabharata English only
+      const { data, error } = await supabase.rpc("match_scriptures_combined", {
+        query_embedding: queryEmbedding,
+        match_threshold: 0.2,
+        match_count:     10,
+      });
+      if (error) console.error("Combined search error:", error);
+      results = data || [];
+      console.log("Combined search:", results.length, "results");
+    }
+
+    if (results.length === 0) {
+      console.warn("No results — check Supabase index and thresholds");
+    } else {
+      console.log("Top result:", results[0].book_name, results[0].chapter,
+                  results[0].verse_number, "similarity:", results[0].similarity);
+    }
+
+    return results;
+
   } catch (err) {
-    console.error("Scripture search failed:", err);
+    console.error("searchScriptures error:", err);
     return [];
   }
+}
+
+async function rerankPassages(question, passages, lang = "en") {
+  if (!Array.isArray(passages) || passages.length === 0) return [];
+
+  const candidates = passages.slice(0, 10);
+  const passageSummary = candidates.map((p, index) => ({
+    index,
+    source: `${p.book_name || "Unknown"}${p.chapter ? ` ${p.chapter}` : ""}${p.verse_number ? `.${p.verse_number}` : ""}`,
+    sanskrit: (p.sanskrit_text || "").slice(0, 220),
+    english: (p.english_translation || "").slice(0, 220),
+    hindi: (p.hindi_translation || "").slice(0, 220),
+  }));
+
+  try {
+    const q = question.toLowerCase();
+    const wantsGita = q.includes("gita") || q.includes("bhagavad");
+
+    const response = await fetch("https://api.x.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${import.meta.env.VITE_GROK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "grok-4.5",
+        max_tokens: 300,
+        messages: [
+          {
+            role: "system",
+            content: `You are a relevance filter for Hindu scripture retrieval.
+Given a user question and numbered scripture passages, return ONLY a JSON object
+with the indices of the 3 most relevant passages.
+Format: {"relevant": [0, 2, 4]}
+STRICT RULES:
+- If the question mentions "Bhagavad Gita" or "Gita", ONLY pick passages 
+  where the source says "Bhagavad Gita" — never Mahabharata Critical Edition
+  even if those chapters contain Gita verses
+- If the question mentions "Mahabharata", prefer Mahabharata passages
+- Pick passages that directly address the topic
+- Return ONLY the JSON, nothing else
+${wantsGita ? "- USER WANTS BHAGAVAD GITA ONLY: reject any Mahabharata passage" : ""}`,
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              question,
+              lang,
+              passages: passageSummary,
+            }),
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+
+    const raw = data.choices?.[0]?.message?.content || "{}";
+    const cleaned = raw.replace(/```json|```/gi, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const candidateIndexes = Array.isArray(parsed.relevant) ? parsed.relevant : [];
+
+    const indices = candidateIndexes
+      .map(value => Number(value))
+      .filter(value => Number.isInteger(value) && value >= 0 && value < candidates.length);
+
+    if (indices.length > 0) {
+      return [...new Set(indices)].map(index => candidates[index]);
+    }
+  } catch (err) {
+    console.warn("Rerank failed; falling back to top matches.", err);
+  }
+
+  return candidates.slice(0, 4);
 }
 
 function buildScriptureContext(passages) {
   if (!passages || passages.length === 0) return "";
 
   const entries = passages.map(p => {
-    const source = `${p.book_name}${p.chapter ? ` ${p.chapter}` : ""}${p.verse_number ? `.${p.verse_number}` : ""}`;
-    const textContent = p.english_translation && p.english_translation.length > 20
-      ? p.english_translation
-      : p.sanskrit_text || "";
-    const hasEnglish = p.english_translation && p.english_translation.length > 20;
+    const source = [
+      p.book_name,
+      p.chapter   ? `Chapter ${p.chapter}`  : "",
+      p.verse_number ? `Verse ${p.verse_number}` : "",
+    ].filter(Boolean).join(", ");
 
-    return `[
-${source}]
-${p.transliteration ? `Transliteration: ${p.transliteration.slice(0, 200)}` : ""}
-${hasEnglish ? `Translation: ${textContent.slice(0, 600)}` : `Sanskrit: ${textContent.slice(0, 400)}`}
-Similarity: ${p.similarity ? p.similarity.toFixed(3) : ""}`;
-  }).join("\n\n---\n\n");
+    // Sanskrit — show Devanagari with proper line breaks
+    const sanskrit = p.sanskrit_text && p.sanskrit_text.trim().length > 5
+      ? p.sanskrit_text.trim()
+          .replace(/।।[\d\.\-]+।।/g, '')
+          .replace(/\n+/g, '\n')
+          .trim()
+      : null;
 
-  return `\n\nRELEVANT PASSAGES FROM BHAGAVAD GITA AND MAHABHARATA:\n\n${entries}\n\nBase your answer primarily on these passages. Always cite the source.`;
+    // English — only if it's real content not an auto-generated label
+    const english = p.english_translation &&
+      p.english_translation.length > 100 &&
+      !p.english_translation.startsWith("Mahabharata") &&
+      !p.english_translation.startsWith("Bhagavad")
+        ? p.english_translation.trim()
+        : null;
+
+    const lines = [
+      `📖 SOURCE: ${source}`,
+      sanskrit ? `\nSANSKRIT:\n${sanskrit.slice(0, 500)}` : "",
+      english  ? `\nENGLISH TRANSLATION:\n${english.slice(0, 600)}`  : "",
+      p.similarity ? `\nRELEVANCE: ${(p.similarity * 100).toFixed(0)}%` : "",
+    ];
+
+    return lines.filter(Boolean).join("\n");
+  }).join("\n\n════════════════\n\n");
+
+  return `\n\nRELEVANT SCRIPTURE PASSAGES:\n\n${entries}\n\n════════════════\n\nINSTRUCTIONS FOR USING THESE PASSAGES:\n- Always quote the Sanskrit (Devanagari) text first when available\n- Then provide the English translation\n- Cite the source exactly as given above\n- Do NOT show IAST (Latin letters with diacritics like ā, ī, ṛ) to the user\n- If Sanskrit is present, always include it in your response`;
 }
 
 // ── Daily shloka rotates by day ───────────────────────────────────────────────
@@ -81,9 +216,10 @@ const MOODS = [
 const GROK_API_KEY = import.meta.env.VITE_GROK_API_KEY || "";
 
 async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null) {
-  // 1. Find the most relevant scriptures for this question
-  const relevant = await searchScriptures(question, mood, 5);
-  const scriptureContext = buildScriptureContext(relevant);
+  const relevant = await searchScriptures(question, mood, 10);
+  const reranked = await rerankPassages(question, relevant, lang);
+  const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
+  const scriptureContext = buildScriptureContext(bestPassages);
   const langInstruction = lang === "hi"
     ? "\nIMPORTANT: Respond ENTIRELY in Hindi (Devanagari script). Keep Sanskrit verses in Sanskrit but give ALL explanations in Hindi. Do not use English except for source references like 'Bhagavad Gita 2.47'.\n"
     : "";
@@ -105,72 +241,108 @@ async function askSpiritualGuide(question, mood, conversationHistory, lang = "en
     daily: "Emphasise practical daily habits, sadhana, and short actionable practices that can be lived consistently in ordinary life."
   }[userGoal] || "Ground the answer in practical wisdom and daily life.";
 
-  // 2. Build system prompt with injected scripture knowledge
-  const systemPrompt = `You are Dharma — a compassionate AI spiritual guide deeply versed in Hindu philosophy and sacred texts. You help people connect ancient Hindu wisdom to their modern life questions.
+  const systemPrompt = `You are Dharma — a warm, wise spiritual companion who knows Hindu philosophy deeply. You speak like a knowledgeable elder friend — direct, warm, occasionally using Hindi or Sanskrit words naturally. You are NOT a chatbot. You are NOT formal. You do NOT use bullet points. You do NOT say "certainly", "indeed", "absolutely", "great question", or any AI filler phrases.
 
-═══════════════════════════════════════════
-CRITICAL RULES — READ BEFORE EVERY RESPONSE
-═══════════════════════════════════════════
+USER PROFILE:
+Name: ${userName}
+Background: ${userBackground} (beginner = just starting, practising = regular seeker, scholarly = deep student)
+Goal: ${userGoal}
+Language: ${lang === 'hi' ? 'Respond entirely in Hindi (Devanagari). Keep Sanskrit as Sanskrit.' : 'Respond in English.'}
+Current mood: ${mood || 'not specified'}
 
-RULE 1 — ONLY USE PROVIDED SCRIPTURE PASSAGES
-You will be given RETRIEVED SCRIPTURE PASSAGES at the end of this prompt.
-ALWAYS base your response on these retrieved passages first.
-If a passage is provided, QUOTE IT ACCURATELY — do not paraphrase the Sanskrit or alter the translation.
-If no passages match the question, say: "The scriptures I have access to don't directly address this, but from general Hindu philosophy..."
+════════════════════════════════════
+VOICE AND TONE — READ CAREFULLY
+════════════════════════════════════
 
-RULE 2 — NEVER FABRICATE VERSE NUMBERS OR CITATIONS
-❌ NEVER invent a verse like "Bhagavad Gita 3.21" if it was not in the retrieved passages.
-❌ NEVER say "As Krishna says in Chapter X..." unless that chapter/verse was retrieved.
-✓ ONLY cite sources that appear in the RETRIEVED SCRIPTURE PASSAGES section.
-✓ If you reference something from your training knowledge, say: "From my knowledge of the Gita..." not a specific verse number.
+Speak like this:
+- Warm but not sentimental
+- Direct but not harsh  
+- Use "you" not "one"
+- Short paragraphs, never more than 4 lines each
+- Occasionally use Sanskrit terms naturally: dharma, karma, chitta, ahankara — but always explain them simply
+- End with ONE genuine question that invites reflection — not a generic "how does that feel?"
+- Never lecture. Never moralize. Never say "it is important to..."
+- Sound like a wise friend texting you, not a professor writing an essay
 
-RULE 3 — HANDLE SANSKRIT-ONLY PASSAGES CAREFULLY
-Some retrieved passages contain only Sanskrit text with no English translation.
-For these:
-✓ Acknowledge the source: "This shloka from [book name] speaks to your question..."
-✓ Explain the contextual meaning based on the surrounding teaching, not word-for-word translation
-✓ Say "The teaching of this passage is..." rather than "This translates as..."
-❌ NEVER attempt word-for-word Sanskrit translation unless you are certain
+DO NOT sound like this:
+❌ "Certainly! That's a wonderful question about karma..."
+❌ "The Bhagavad Gita teaches us several important lessons..."  
+❌ "It is crucial to understand that..."
+❌ Bullet points or numbered lists
+❌ Headers or bold text in the response
 
-RULE 4 — SIGNAL UNCERTAINTY CLEARLY
-When you are not sure about a teaching, say so:
-✓ "The Gita's general teaching on this is..."
-✓ "Hindu philosophy broadly holds that..."
-✓ "I'm drawing from general Vedantic understanding here..."
-❌ NEVER state uncertain things with false confidence
+ADAPT TO BACKGROUND:
+- beginner: simple words, one verse max, real-life examples (office, family, traffic)
+- practising: assume they know karma/dharma, go slightly deeper, 1-2 verses
+- scholarly: full philosophical depth, cross-references, Sanskrit with meaning
 
-RULE 5 — WHEN NO SCRIPTURE FITS
-If the retrieved passages don't match the question well:
-✓ Use your general knowledge of Hindu philosophy
-✓ Be clear: "Drawing from the broader spirit of the Gita..." or "Hindu philosophy teaches..."
-✓ Recommend they explore a specific text: "You might find the Yoga Sutras particularly relevant here..."
-❌ NEVER force an irrelevant verse to fit the question
+════════════════════════════════════
+SCRIPTURE RULES — NON-NEGOTIABLE
+════════════════════════════════════
 
-═══════════════════════════════════════════
-YOUR RESPONSE STYLE
-═══════════════════════════════════════════
+RULE 1: Only cite passages from the RETRIEVED PASSAGES section below.
+RULE 2: Never invent verse numbers. If unsure, say "the Gita teaches..." without a specific citation.
+RULE 3: When showing Sanskrit, always show Devanagari script. Never show IAST (ā, ī, ṛ etc.) to the user.
+RULE 4: Format every scripture quote exactly like this:
 
-Tone: Warm, wise, non-preachy — like a knowledgeable elder friend, not a professor
-Length: 3-4 short paragraphs maximum. Never lecture. Invite reflection.
-Structure:
-  1. Open with the most relevant retrieved passage (if available) — cite it accurately
-  2. Explain what this teaching means for the user's specific situation
-  3. Connect it to their emotion/question in plain modern language
-  4. End with ONE gentle question that invites them to reflect deeper
+कर्मण्येवाधिकारस्ते मा फलेषु कदाचन।
+"You have the right to act, but never to the fruits of action." — Bhagavad Gita 2.47
 
-Language depth based on user profile:
-- Beginner: simple language, one verse max, relatable modern examples, no jargon
-- Practising: balanced depth, 1-2 verses, assume familiarity with karma/dharma concepts
-- Scholarly: full philosophical depth, multiple cross-references welcome, Sanskrit with transliteration
+RULE 5: If retrieved passages don't match the question, say "I don't have a passage that speaks directly to this, but from what I know of the Gita..." — never force an irrelevant verse.
+RULE 6: If user asks for quotes from a specific text, ONLY use that text.
 
-User's current mood: ${mood || "not specified"}
-User's name: ${userName}
-User's background: ${userBackground}
-User's goal: ${userGoal}
-Language: ${lang === 'hi' ? 'Respond ENTIRELY in Hindi (Devanagari script). Keep Sanskrit in Sanskrit but ALL explanations in Hindi. Do not use English except for source references.' : 'Respond in English.'}
+════════════════════════════════════
+FEW-SHOT EXAMPLES — MATCH THIS STYLE
+════════════════════════════════════
+
+EXAMPLE 1 — Emotional question, beginner user seeking peace:
+User: "I keep failing at everything I try. What does the Gita say?"
+Good response:
+"Krishna would probably say you're asking the wrong question, ${userName}.
+
+The Gita doesn't really talk about success and failure the way we do. It talks about what you put in — the effort, the sincerity, the showing up — and it says that part is entirely yours. What happens after? That belongs to something larger than you.
+
+कर्मण्येवाधिकारस्ते मा फलेषु कदाचन।
+"Your right is to the work alone, never to its fruits." — Bhagavad Gita 2.47
+
+This isn't a consolation prize. It's actually a relief. You don't have to control the outcome — you were never meant to. You just have to do your part well.
+
+What would it feel like to put in your best effort today without checking if it 'worked'?"
+
+EXAMPLE 2 — Philosophical question, scholarly user:
+User: "What is the relationship between karma and dharma in the Mahabharata?"
+Good response:
+"The Mahabharata is essentially one long argument about exactly this question — and it doesn't give you a clean answer, which is the point.
+
+Yudhishthira follows dharma perfectly and suffers enormously. Karna has admirable qualities but makes choices that lead to tragedy. The epic seems to be saying that karma and dharma aren't a formula — they're in permanent tension.
+
+What the Shanti Parva eventually arrives at is something closer to this: dharma is the right action given your nature, your moment, and your relationships. Karma is what that action sets in motion — not as punishment, but as consequence. The two aren't separate. Every dharmic choice is also a karmic one.
+
+Where do you feel that tension most in your own life — between what's right and what you're being pulled toward?"
+
+EXAMPLE 3 — Hindi response, practising user:
+User: "मैं अपने परिवार से थका हुआ हूँ"
+Good response:
+"यह बहुत स्वाभाविक है, ${userName}। परिवार वह जगह है जहाँ हम सबसे ज़्यादा खुद होते हैं — और इसीलिए सबसे ज़्यादा थकते भी हैं।
+
+गीता में कृष्ण एक बात बार-बार कहते हैं — जो काम तुम्हारा है, वो करो। उसका फल तुम्हारे हाथ में नहीं है। परिवार को बदलना तुम्हारे हाथ में नहीं, लेकिन अपना भाव — वो तुम चुन सकते हो।
+
+क्या थकान रिश्तों से है, या उम्मीदों से?"
+
+════════════════════════════════════
+RESPONSE STRUCTURE
+════════════════════════════════════
+
+1. Open with the human moment — acknowledge what they're feeling in 1-2 sentences. No "I understand that..."
+2. Bring in the scripture naturally — not as a lecture but as a conversation
+3. Show the Sanskrit + translation if available
+4. Connect it back to their specific situation
+5. End with ONE genuine question
+
+Total length: 150-250 words for emotional questions. Up to 350 for philosophical/scholarly questions.
+Never longer than this.
 
 ${scriptureContext}`;
-
   const messages = [
     { role: "system", content: systemPrompt },
     ...conversationHistory,
@@ -192,7 +364,7 @@ ${scriptureContext}`;
 
   const data = await response.json();
   if (data.error) throw new Error(data.error.message);
-  return { reply: data.choices[0].message.content, scriptures: relevant };
+  return { reply: data.choices[0].message.content, scriptures: bestPassages };
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -317,6 +489,12 @@ const styles = `
   .bubble.user { background: rgba(166,109,43,0.1); border: 1px solid rgba(166,109,43,0.18); color: #1f302c; border-bottom-right-radius: 4px; }
   .bubble.assistant { background: rgba(255,255,255,0.64); border: 1px solid rgba(41,74,63,0.08); color: #1a352f; font-family: 'Noto Sans Devanagari', 'Crimson Pro', serif; font-size: 16px; border-bottom-left-radius: 4px; white-space: pre-wrap; }
   .bubble.assistant em { color: #a56d2b; font-style: italic; }
+  .scripture-block { display: block; margin: 10px 0; }
+  .scripture-label { color: #8a6a3d; font-weight: 600; }
+  .scripture-sanskrit { display: block; margin-top: 6px; color: #7a5b31; font-family: 'Crimson Pro', serif; font-style: italic; font-weight: 500; line-height: 1.8; }
+  .scripture-sanskrit-text { display: block; white-space: pre-wrap; color: #7a5b31; font-family: 'Crimson Pro', serif; font-style: italic; }
+  .scripture-translation { color: #23433a; line-height: 1.7; }
+  .scripture-source { margin-top: 8px; font-size: 12px; color: #7d6f62; letter-spacing: 0.3px; line-height: 1.5; font-style: italic; }
 
   /* Scripture chips shown after response */
   .scripture-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -390,19 +568,100 @@ const styles = `
   ::-webkit-scrollbar-thumb { background: rgba(200,140,60,0.2); border-radius: 2px; }
 `;
 
-// ── Text renderer (handles *italic* markdown) ─────────────────────────────────
+// ── Text renderer (keep markdown emphasis, remove the * markers visually) ───
+function renderInlineMarkdown(content) {
+  const parts = [];
+  const regex = /(\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_)/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = regex.exec(String(content))) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(<span key={`plain-${lastIndex}`}>{content.slice(lastIndex, match.index)}</span>);
+    }
+
+    const token = match[0];
+    if (token.startsWith("**") || token.startsWith("__")) {
+      parts.push(<strong key={`strong-${match.index}`}>{token.slice(2, -2)}</strong>);
+    } else {
+      parts.push(<em key={`em-${match.index}`}>{token.slice(1, -1)}</em>);
+    }
+
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < content.length) {
+    parts.push(<span key={`plain-end-${lastIndex}`}>{content.slice(lastIndex)}</span>);
+  }
+
+  return <>{parts}</>;
+}
+
 function RichText({ text }) {
   if (!text) return null;
-  const parts = text.split(/(\*[^*]+\*)/g);
-  return (
-    <>
-      {parts.map((part, i) =>
-        part.startsWith("*") && part.endsWith("*")
-          ? <em key={i}>{part.slice(1, -1)}</em>
-          : <span key={i}>{part}</span>
-      )}
-    </>
-  );
+
+  const lines = String(text).split(/\n/);
+  const output = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      output.push(<br key={`br-${i}`} />);
+      continue;
+    }
+
+    if (/^Sanskrit:/i.test(trimmed)) {
+      const sanskritLines = [];
+      const remainder = trimmed.replace(/^Sanskrit:\s*/i, "");
+      if (remainder) sanskritLines.push(remainder);
+
+      let j = i + 1;
+      while (j < lines.length) {
+        const candidate = lines[j].trim();
+        if (!candidate) {
+          j += 1;
+          continue;
+        }
+        if (/^(Translation:|Source:)/i.test(candidate)) break;
+        sanskritLines.push(lines[j].trim());
+        j += 1;
+      }
+
+      output.push(
+        <div key={`sanskrit-${i}`} className="scripture-block scripture-sanskrit">
+          <span className="scripture-label">Sanskrit:</span>
+          <span className="scripture-sanskrit-text">{sanskritLines.join("\n")}</span>
+        </div>
+      );
+
+      i = j - 1;
+      continue;
+    }
+
+    if (/^Translation:/i.test(trimmed)) {
+      output.push(
+        <div key={`translation-${i}`} className="scripture-block scripture-translation">
+          <span className="scripture-label">Translation:</span> {trimmed.replace(/^Translation:\s*/i, "")}
+        </div>
+      );
+      continue;
+    }
+
+    if (/^Source:/i.test(trimmed)) {
+      output.push(
+        <div key={`source-${i}`} className="scripture-block scripture-source">
+          <span className="scripture-label">Source:</span> {trimmed.replace(/^Source:\s*/i, "")}
+        </div>
+      );
+      continue;
+    }
+
+    output.push(<div key={`text-${i}`}>{renderInlineMarkdown(line)}</div>);
+  }
+
+  return <>{output}</>;
 }
 
 // ── Families for the scripture browser (localized per `lang`) ─────────────
@@ -438,6 +697,7 @@ export default function DharmaApp() {
 
   const [tab, setTab] = useState("home");
   const [selectedMood, setSelectedMood] = useState(null);
+  const [sharePassage, setSharePassage] = useState(null);
   const [dbScriptures, setDbScriptures] = useState([]);
   const [dbLoading, setDbLoading] = useState(true);
   const [todayShloka] = useState(() => SCRIPTURES[new Date().getDate() % SCRIPTURES.length]);
@@ -508,7 +768,13 @@ export default function DharmaApp() {
 
     try {
       const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile);
-      setMessages(prev => [...prev, { type: "assistant", text: reply, scriptures }]);
+      const assistantMessage = {
+        type: "assistant",
+        text: reply,
+        scriptures,
+        passages: scriptures || [],
+      };
+      setMessages(prev => [...prev, assistantMessage]);
       setConvHistory(prev => [
         ...prev,
         { role: "user", content: question },
@@ -690,12 +956,38 @@ export default function DharmaApp() {
                   <div className={`bubble ${msg.type}`}>
                     {msg.type === "assistant" ? <RichText text={msg.text} /> : msg.text}
                   </div>
-                  {msg.type === "assistant" && msg.scriptures?.length > 0 && (
-                    <div className="scripture-chips">
-                      {msg.scriptures.map(s => (
-                        <span key={s.id} className="scripture-chip" onClick={() => { setTab("texts"); setSelectedScripture(s); }}>{s.source}</span>
-                      ))}
-                    </div>
+                  {msg.type === "assistant" && (msg.scriptures?.length > 0 || msg.passages?.length > 0) && (
+                    <>
+                      <div className="scripture-chips">
+                        {(msg.scriptures || msg.passages || []).map((s, idx) => (
+                          <span key={s.id || `${s.book_name || 'verse'}-${idx}`} className="scripture-chip" onClick={() => { setTab("texts"); setSelectedScripture(s); }}>{s.source || `${s.book_name || 'Scripture'}${s.chapter ? ` ${s.chapter}` : ''}${s.verse_number ? `.${s.verse_number}` : ''}`}</span>
+                        ))}
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+                        {(msg.passages || msg.scriptures || []).slice(0, 3).map((p, idx) => (
+                          p.sanskrit_text || p.english_translation ? (
+                            <button
+                              key={idx}
+                              onClick={() => setSharePassage(p)}
+                              style={{
+                                background: 'rgba(200,140,60,0.1)',
+                                border: '0.5px solid rgba(200,140,60,0.3)',
+                                borderRadius: 8,
+                                padding: '6px 12px',
+                                color: '#c88c3c',
+                                fontSize: 11,
+                                cursor: 'pointer',
+                                fontFamily: 'Inter, sans-serif',
+                                letterSpacing: '0.5px',
+                              }}
+                            >
+                              📤 Share {p.book_name?.includes('Gita') ? 'Gita' : 'Mahabharata'} verse
+                            </button>
+                          ) : null
+                        ))}
+                      </div>
+                    </>
                   )}
                 </div>
               ))}
@@ -737,6 +1029,22 @@ export default function DharmaApp() {
                 <div className="detail-translation">"{lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"</div>
                 <div className="detail-commentary-label">{lang === 'hi' ? 'टीका' : 'Commentary'}</div>
                 <div className="detail-commentary">{lang === 'hi' && selectedScripture.hindi_commentary ? selectedScripture.hindi_commentary : selectedScripture.commentary || ""}</div>
+                <button
+                  onClick={() => setSharePassage(selectedScripture)}
+                  style={{
+                    background: 'none',
+                    border: '0.5px solid rgba(200,140,60,0.2)',
+                    borderRadius: 6,
+                    padding: '4px 10px',
+                    color: 'rgba(200,140,60,0.6)',
+                    fontSize: 11,
+                    cursor: 'pointer',
+                    marginTop: 8,
+                    marginBottom: 12,
+                  }}
+                >
+                  📤 Share
+                </button>
                 <button className="ask-about-btn"
                   onClick={() => { setTab("guide"); sendMessage(`Tell me more about this teaching from ${selectedScripture.book_name}${selectedScripture.chapter ? ` ${selectedScripture.chapter}` : ""}${selectedScripture.verse_number ? `.${selectedScripture.verse_number}` : ""}: "${lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"`); }}>
                   {lang === 'hi' ? 'इस श्लोक के बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this verse →'}
@@ -764,6 +1072,21 @@ export default function DharmaApp() {
                     </div>
                     <div className="scripture-entry-verse">{s.sanskrit_text}</div>
                     <div className="scripture-entry-translation">{lang === 'hi' && s.hindi_translation ? s.hindi_translation : s.english_translation}</div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setSharePassage(s); }}
+                      style={{
+                        background: 'none',
+                        border: '0.5px solid rgba(200,140,60,0.2)',
+                        borderRadius: 6,
+                        padding: '4px 10px',
+                        color: 'rgba(200,140,60,0.6)',
+                        fontSize: 11,
+                        cursor: 'pointer',
+                        marginTop: 8,
+                      }}
+                    >
+                      📤 Share
+                    </button>
                   </div>
                 ))}
               </div>
@@ -778,6 +1101,13 @@ export default function DharmaApp() {
         )}
 
       </div>
+
+      {sharePassage && (
+        <ShareCard
+          passage={sharePassage}
+          onClose={() => setSharePassage(null)}
+        />
+      )}
     </>
   );
 }
