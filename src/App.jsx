@@ -1,10 +1,39 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import Onboarding from "./Onboarding.jsx";
 import SadhanaTracker from "./SadhanaTracker.jsx";
 import ShareCard from "./ShareCard.jsx";
 import { SCRIPTURES, findRelevantScriptures } from "./scriptures.js";
+
+// ── DEV MODE — set to false before pushing to production ──
+const DEV_MODE = false;
+
+const DEV_RESPONSE = {
+  reply: "Krishna speaks directly to this, Anchit. The Gita doesn't ask you to be fearless — it asks you to act despite the fear. That's the whole point of Arjuna's crisis on the battlefield. He was terrified too.\n\nकर्मण्येवाधिकारस्ते मा फलेषु कदाचन।\n\"Your right is to the work alone, never to its fruits.\" — Bhagavad Gita 2.47\n\nThe anxiety you feel about outcomes is human. But it's also a signal that you're attached to something specific happening. What would you do today if the result truly didn't matter?",
+  scriptures: [
+    {
+      id: 999,
+      book_name: "Bhagavad Gita",
+      chapter: 2,
+      verse_number: "47",
+      sanskrit_text: "कर्मण्येवाधिकारस्ते मा फलेषु कदाचन।\nमा कर्मफलहेतुर्भूर्मा ते सङ्गोऽस्त्वकर्मणि॥",
+      english_translation: "You have the right to perform your duties, but you are not entitled to the fruits of your actions. Never consider yourself the cause of the results of your activities, and never be attached to not doing your duty.",
+      hindi_translation: "कर्म करने का तुम्हें अधिकार है, परंतु उसके फल पर कभी नहीं।",
+      similarity: 0.95,
+    },
+    {
+      id: 998,
+      book_name: "Mahabharata — Udyoga Parva",
+      chapter: 5,
+      verse_number: "LXXVII",
+      sanskrit_text: "",
+      english_translation: "Let a man deliberate and act, since deliberation is the root of all action. One who acts without deliberation destroys his own cause, like a lamp without oil.",
+      hindi_translation: "",
+      similarity: 0.82,
+    }
+  ]
+};
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
@@ -15,6 +44,38 @@ const openaiClient = new OpenAI({
   apiKey: import.meta.env.VITE_OPENAI_API_KEY,
   dangerouslyAllowBrowser: true,
 });
+
+async function saveToHistory(supabaseClient, deviceId, question, answer, passages, mood) {
+  try {
+    await supabaseClient.from("conversation_history").insert({
+      device_id: deviceId,
+      question: question.slice(0, 500),
+      answer: answer.slice(0, 1000),
+      sources: passages.map(p => p.book_name).join(", "),
+      mood: mood || "",
+      verses_shown: passages.map(p =>
+        `${p.book_name} ${p.chapter}.${p.verse_number}`
+      ).join(", "),
+      created_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.log("History save failed:", e.message);
+  }
+}
+
+async function loadHistory(supabaseClient, deviceId) {
+  try {
+    const { data } = await supabaseClient
+      .from("conversation_history")
+      .select("question, sources, mood, verses_shown, created_at")
+      .eq("device_id", deviceId)
+      .order("created_at", { ascending: false })
+      .limit(10);
+    return data || [];
+  } catch (e) {
+    return [];
+  }
+}
 
 async function searchScriptures(query, mood = "", maxResults = 10) {
   const searchText = mood ? `${query} feeling ${mood}` : query;
@@ -215,13 +276,46 @@ const MOODS = [
 // ── Grok API ──────────────────────────────────────────────────────────────────
 const GROK_API_KEY = import.meta.env.VITE_GROK_API_KEY || "";
 
-async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null) {
+async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null, sessionHistory = [], persistentHistory = []) {
+  // DEV MODE — skip API calls for UI testing
+  if (DEV_MODE) {
+    await new Promise(r => setTimeout(r, 500));
+    return DEV_RESPONSE;
+  }
+
   const relevant = await searchScriptures(question, mood, 10);
   const reranked = await rerankPassages(question, relevant, lang);
   const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
   const scriptureContext = buildScriptureContext(bestPassages);
   const langInstruction = lang === "hi"
     ? "\nIMPORTANT: Respond ENTIRELY in Hindi (Devanagari script). Keep Sanskrit verses in Sanskrit but give ALL explanations in Hindi. Do not use English except for source references like 'Bhagavad Gita 2.47'.\n"
+    : "";
+
+  const sessionCtx = sessionHistory.length > 0
+    ? "\nSESSION CONTEXT (what this user asked earlier today):\n" +
+      sessionHistory.slice(-3).map((h, i) =>
+        `${i+1}. "${h.question}" → topics: ${h.sources || "general"}`
+      ).join("\n")
+    : "";
+
+  const persistCtx = persistentHistory.length > 0
+    ? "\nUSER HISTORY (from previous sessions):\n" +
+      persistentHistory.slice(0, 5).map((h, i) => {
+        const mood = h.mood ? ` — felt: ${h.mood}` : "";
+        return `${i+1}. Asked: "${h.question?.slice(0,80)}"${mood}`;
+      }).join("\n") +
+      (() => {
+        const moods = persistentHistory
+          .filter(h => h.mood)
+          .map(h => h.mood);
+        if (moods.length < 2) return "";
+        const counts = moods.reduce((a, m) => ({ ...a, [m]: (a[m]||0)+1 }), {});
+        const topMood = Object.entries(counts).sort((a,b) => b[1]-a[1])[0];
+        if (topMood && topMood[1] >= 2) {
+          return `\n→ Pattern noticed: this user frequently feels "${topMood[0]}" (${topMood[1]} times). Acknowledge this gently if relevant — their journey shows growth.`;
+        }
+        return "";
+      })()
     : "";
 
   const userName = profile?.name || "Seeker";
@@ -249,6 +343,8 @@ Background: ${userBackground} (beginner = just starting, practising = regular se
 Goal: ${userGoal}
 Language: ${lang === 'hi' ? 'Respond entirely in Hindi (Devanagari). Keep Sanskrit as Sanskrit.' : 'Respond in English.'}
 Current mood: ${mood || 'not specified'}
+${sessionCtx}
+${persistCtx}
 
 ════════════════════════════════════
 VOICE AND TONE — READ CAREFULLY
@@ -383,52 +479,144 @@ const styles = `
   }
 
   .app {
+    --panel-tint: rgba(17, 19, 22, 0.54);
+    --panel-soft: rgba(255,255,255,0.08);
+    --panel-strong: rgba(255,255,255,0.14);
+    --text-main: #f8f2e8;
+    --text-soft: #d5c4a2;
+    --text-muted: #b8b2a3;
+    --accent: #d9b36b;
+    --accent-strong: #f0c86a;
+    --card-border: rgba(255,255,255,0.1);
     max-width: 430px; margin: 0 auto; min-height: 100vh;
     display: flex; flex-direction: column;
-    background: linear-gradient(180deg, #fcf9f4 0%, #f2ebdf 100%);
     position: relative; overflow: hidden;
     box-shadow: 0 0 0 1px rgba(18, 30, 25, 0.04), 0 18px 40px rgba(45, 53, 46, 0.08);
+    color: var(--text-main);
+    background: linear-gradient(180deg, #071018 0%, #0c1f2d 100%);
   }
   .app::before {
     content: ''; position: fixed; top: -100px; left: 50%; transform: translateX(-50%);
     width: 340px; height: 340px;
-    background: radial-gradient(circle, rgba(110,166,128,0.16) 0%, rgba(203,147,67,0.08) 28%, transparent 72%);
+    background: radial-gradient(circle, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 28%, transparent 72%);
     pointer-events: none; z-index: 0;
   }
+  .app.brahma { --panel-tint: rgba(21, 13, 24, 0.62); --panel-soft: rgba(255,255,255,0.07); --accent: #d9b36b; --text-soft: #f0d9af; }
+  .app.sunrise { --panel-tint: rgba(47, 20, 7, 0.52); --panel-soft: rgba(255,255,255,0.08); --accent: #f3b76c; --text-soft: #f9d7af; }
+  .app.day { --panel-tint: rgba(10, 27, 39, 0.44); --panel-soft: rgba(255,255,255,0.1); --accent: #f8d77d; --text-soft: #e7ecea; }
+  .app.sunset { --panel-tint: rgba(50, 18, 7, 0.52); --panel-soft: rgba(255,255,255,0.08); --accent: #ffaf6c; --text-soft: #f7d5b9; }
+  .app.night { --panel-tint: rgba(5, 12, 18, 0.66); --panel-soft: rgba(255,255,255,0.06); --accent: #d9c48a; --text-soft: #dfe8f6; }
 
   /* Nav */
-  .nav { display: flex; align-items: center; justify-content: flex-start; gap: 12px; padding: 14px 20px 10px; position: relative; z-index: 10; }
-  .nav-logo { font-family: 'Crimson Pro', serif; font-size: 26px; font-weight: 600; color: #b6732a; letter-spacing: 0.5px; margin-right: 8px; }
+  .nav {
+    display: flex; align-items: center; justify-content: flex-start; gap: 10px;
+    padding: 14px 20px 10px; position: relative; z-index: 10;
+    width: 100%; max-width: 100%; overflow: hidden;
+    background: rgba(10, 13, 17, 0.26); backdrop-filter: blur(8px);
+  }
+  .nav-logo { flex-shrink: 0; font-family: 'Crimson Pro', serif; font-size: 26px; font-weight: 600; color: var(--accent); letter-spacing: 0.5px; margin-right: 4px; }
   .nav-tabs {
-    display: flex; gap: 8px; flex: 1; min-width: 0;
-    background: rgba(255,255,255,0.68); backdrop-filter: blur(8px);
-    padding: 6px; border-radius: 18px; border: 1px solid rgba(44,71,61,0.08);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+    display: flex; gap: 6px; flex: 1 1 auto; min-width: 0; width: 100%;
+    background: rgba(16, 21, 26, 0.42); backdrop-filter: blur(8px);
+    padding: 6px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 10px 24px rgba(34, 42, 38, 0.12);
+    overflow: hidden;
   }
   .nav-tab {
-    flex: 1; background: transparent; border: none; color: #5f7267; font-size: 12px; font-weight: 600;
-    padding: 10px 8px; border-radius: 12px; cursor: pointer; font-family: 'Inter', sans-serif;
-    transition: all 0.2s ease; letter-spacing: 0.02em;
+    flex: 1 1 auto; min-width: 0; background: transparent; border: none; color: rgba(233, 220, 199, 0.8); font-size: 12px; font-weight: 600;
+    padding: 10px 6px; border-radius: 12px; cursor: pointer; font-family: 'Inter', sans-serif;
+    transition: all 0.2s ease; letter-spacing: 0.02em; white-space: nowrap;
+    text-overflow: clip;
   }
   .nav-tab.active {
-    background: linear-gradient(135deg, #a56d2b 0%, #d3a95a 100%);
-    color: #fffaf2; box-shadow: 0 8px 16px rgba(165,109,43,0.18);
+    background: linear-gradient(135deg, rgba(214,157,69,0.9) 0%, rgba(239,196,96,0.95) 100%);
+    color: #17130d; box-shadow: 0 8px 16px rgba(214,157,69,0.24);
   }
 
   /* Screens */
-  .screen { flex: 1; padding: 16px 24px 32px; overflow-y: auto; position: relative; z-index: 1; }
+  .screen { flex: 1; padding: 16px 24px 32px; overflow-y: auto; position: relative; z-index: 1; background: rgba(9, 12, 14, 0.18); }
 
   /* Home */
   .greeting {
     font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif;
     font-size: 28px;
     font-weight: 600;
-    color: #1f302c;
+    color: var(--text-main);
     line-height: 1.4;
     margin-bottom: 4px;
     unicode-bidi: plaintext;
+    letter-spacing: -0.02em;
   }
-  .greeting-sub { font-size: 13px; color: #61756d; margin-bottom: 28px; }
+  .greeting-sub {
+    font-size: 12px; color: var(--text-muted); margin-bottom: 24px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; line-height: 1.6;
+  }
+
+  .time-sky {
+    position: absolute; inset: 0; pointer-events: none; z-index: 0; opacity: 0.95; transition: all 0.8s ease;
+  }
+  .time-sky.brahma {
+    background: linear-gradient(180deg, rgba(18, 9, 20, 0.9), rgba(29, 12, 35, 0.28));
+  }
+  .time-sky.sunrise {
+    background: linear-gradient(180deg, rgba(120, 46, 10, 0.28), rgba(255, 176, 87, 0.12));
+  }
+  .time-sky.day {
+    background: linear-gradient(180deg, rgba(9, 19, 32, 0.28), rgba(18, 64, 108, 0.09));
+  }
+  .time-sky.sunset {
+    background: linear-gradient(180deg, rgba(87, 26, 5, 0.26), rgba(225, 125, 68, 0.1));
+  }
+  .time-sky.night {
+    background: linear-gradient(180deg, rgba(0, 5, 8, 0.7), rgba(9, 24, 39, 0.18));
+  }
+
+  .time-glow {
+    position: absolute; left: 50%; transform: translateX(-50%); width: 210px; height: 210px; border-radius: 50%; filter: blur(42px); pointer-events: none; z-index: 0; transition: all 0.8s ease;
+  }
+  .time-glow.brahma { background: radial-gradient(circle, rgba(180,120,255,0.18), transparent 65%); top: 18px; }
+  .time-glow.sunrise { background: radial-gradient(circle, rgba(255,165,70,0.22), transparent 70%); top: 16px; }
+  .time-glow.day { background: radial-gradient(circle, rgba(182, 230, 255, 0.15), transparent 68%); top: 24px; }
+  .time-glow.sunset { background: radial-gradient(circle, rgba(255,149,82,0.2), transparent 66%); top: 20px; }
+  .time-glow.night { background: radial-gradient(circle, rgba(214, 230, 255, 0.16), transparent 68%); top: 16px; }
+
+  .time-sun {
+    position: absolute; left: 50%; transform: translateX(-50%); width: 120px; height: 120px; border-radius: 50%; pointer-events: none; z-index: 0; transition: all 0.8s ease;
+    opacity: 0.9;
+  }
+  .time-sun.brahma {
+    top: 12px; right: 18px; left: auto; transform: none; width: 36px; height: 36px;
+    background: radial-gradient(circle at 38% 35%, #fff3c9, #d4c060);
+    box-shadow: 0 0 26px rgba(212,192,96,0.45);
+  }
+  .time-sun.sunrise {
+    top: 30px; right: 28px; left: auto; transform: none; width: 52px; height: 52px;
+    background: radial-gradient(circle at 40% 40%, #fff4b5, #ffb530);
+    box-shadow: 0 0 40px rgba(255,177,40,0.5), 0 0 80px rgba(255,116,22,0.18);
+    animation: sunriseFloat 5s ease-in-out infinite alternate;
+  }
+  .time-sun.day {
+    top: 18px; right: 28px; left: auto; transform: none; width: 38px; height: 38px;
+    background: radial-gradient(circle at 40% 35%, #fffef1, #ffd840);
+    box-shadow: 0 0 30px rgba(255,220,80,0.5);
+  }
+  .time-sun.sunset {
+    bottom: 28px; left: 26px; right: auto; transform: none; width: 48px; height: 48px;
+    background: radial-gradient(circle at 45% 40%, #fff1a5, #ff8820);
+    box-shadow: 0 0 35px rgba(255,140,30,0.55), 0 0 70px rgba(255,80,10,0.2);
+    animation: sunsetFloat 5s ease-in-out infinite alternate;
+  }
+  .time-sun.night {
+    top: 16px; right: 32px; left: auto; transform: none; width: 32px; height: 32px;
+    background: radial-gradient(circle at 38% 35%, #fff8e0, #d4c060);
+    box-shadow: 0 0 24px rgba(212,192,96,0.35);
+  }
+  .app.brahma .nav, .app.brahma .screen, .app.brahma .chat-screen, .app.brahma .scripture-browser, .app.brahma .scripture-detail { background: rgba(19, 14, 27, 0.5); }
+  .app.sunrise .nav, .app.sunrise .screen, .app.sunrise .chat-screen, .app.sunrise .scripture-browser, .app.sunrise .scripture-detail { background: rgba(53, 19, 1, 0.3); }
+  .app.day .nav, .app.day .screen, .app.day .chat-screen, .app.day .scripture-browser, .app.day .scripture-detail { background: rgba(8, 22, 38, 0.28); }
+  .app.sunset .nav, .app.sunset .screen, .app.sunset .chat-screen, .app.sunset .scripture-browser, .app.sunset .scripture-detail { background: rgba(61, 26, 8, 0.28); }
+  .app.night .nav, .app.night .screen, .app.night .chat-screen, .app.night .scripture-browser, .app.night .scripture-detail { background: rgba(7, 16, 24, 0.4); }
+  @keyframes sunriseFloat { 0% { transform: scale(0.96) translateY(6px); } 100% { transform: scale(1.08) translateY(-8px); } }
+  @keyframes sunsetFloat { 0% { transform: scale(0.98) translateY(8px); } 100% { transform: scale(1.06) translateY(-10px); } }
 
   .shloka-card {
     background: linear-gradient(135deg, #18342d 0%, #102a25 100%);
@@ -446,24 +634,34 @@ const styles = `
   .shloka-translation { font-size: 14px; color: #e2cf9d; line-height: 1.7; margin-bottom: 12px; }
   .shloka-source { font-size: 11px; color: #b9c7c0; }
 
-  .section-title { font-size: 11px; color: #668077; text-transform: uppercase; margin-bottom: 14px; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; unicode-bidi: plaintext; }
+  .section-title {
+    font-size: 15px; color: var(--text-main); font-weight: 700; letter-spacing: 0.08em;
+    margin: 22px 0 14px; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif;
+    unicode-bidi: plaintext; text-transform: uppercase; opacity: 0.9;
+  }
 
   /* Mood grid */
   .mood-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }
-  .mood-btn { background: rgba(255,255,255,0.56); border: 1px solid rgba(41,74,63,0.08); border-radius: 12px; padding: 12px 4px; cursor: pointer; text-align: center; transition: all 0.2s; color: #21372f; }
-  .mood-btn:hover { border-color: rgba(110,166,128,0.3); background: rgba(110,166,128,0.06); }
-  .mood-btn.selected { border-color: #c88c3c; background: rgba(200,140,60,0.12); }
-  .mood-emoji { font-size: 22px; display: block; margin-bottom: 6px; color: #8d6a3f; font-family: 'Segoe UI Symbol', 'Apple Color Emoji', 'Noto Sans Devanagari', sans-serif; line-height: 1; font-weight: 600; }
-  .mood-label { font-size: 10px; color: #5f6b66; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; }
-  .mood-btn.selected .mood-label { color: #b6732a; }
+  .mood-btn {
+    background: rgba(13, 17, 21, 0.42); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px 4px; cursor: pointer;
+    text-align: center; transition: all 0.2s; color: var(--text-main); box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+  .mood-btn:hover { border-color: rgba(240,200,110,0.5); background: rgba(240,200,110,0.08); }
+  .mood-btn.selected { border-color: var(--accent); background: rgba(240,200,110,0.12); box-shadow: 0 12px 22px rgba(218,179,107,0.12); }
+  .mood-emoji { font-size: 22px; display: block; margin-bottom: 6px; color: var(--accent); font-family: 'Segoe UI Symbol', 'Apple Color Emoji', 'Noto Sans Devanagari', sans-serif; line-height: 1; font-weight: 600; }
+  .mood-label { font-size: 10px; color: rgba(240, 231, 216, 0.8); font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; }
+  .mood-btn.selected .mood-label { color: var(--accent-strong); }
 
   /* Quick cards */
   .quick-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .quick-card { background: rgba(255,255,255,0.56); border: 1px solid rgba(41,74,63,0.08); border-radius: 16px; padding: 18px; cursor: pointer; transition: all 0.2s; box-shadow: 0 10px 24px rgba(36, 52, 48, 0.04); }
-  .quick-card:hover { border-color: rgba(110,166,128,0.3); transform: translateY(-1px); }
-  .quick-icon { font-size: 24px; margin-bottom: 8px; display: block; color: #8d6a3f; font-family: 'Noto Sans Devanagari', 'Segoe UI Symbol', 'DejaVu Sans', sans-serif; line-height: 1; unicode-bidi: plaintext; }
-  .quick-name { font-size: 13px; color: #1d312b; font-weight: 600; margin-bottom: 3px; }
-  .quick-desc { font-size: 11px; color: #648076; line-height: 1.5; }
+  .quick-card {
+    background: rgba(13, 17, 21, 0.42); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 18px; cursor: pointer;
+    transition: all 0.2s; box-shadow: 0 10px 24px rgba(0,0,0,0.08);
+  }
+  .quick-card:hover { border-color: rgba(240,200,110,0.5); transform: translateY(-1px); background: rgba(17, 22, 28, 0.52); }
+  .quick-icon { font-size: 24px; margin-bottom: 8px; display: block; color: var(--accent); font-family: 'Noto Sans Devanagari', 'Segoe UI Symbol', 'DejaVu Sans', sans-serif; line-height: 1; unicode-bidi: plaintext; }
+  .quick-name { font-size: 13px; color: var(--text-main); font-weight: 600; margin-bottom: 3px; }
+  .quick-desc { font-size: 11px; color: rgba(233, 220, 199, 0.75); line-height: 1.5; }
 
   /* Stats bar */
   .stats-bar { display: flex; gap: 10px; margin-bottom: 20px; }
@@ -698,9 +896,20 @@ export default function DharmaApp() {
   const [tab, setTab] = useState("home");
   const [selectedMood, setSelectedMood] = useState(null);
   const [sharePassage, setSharePassage] = useState(null);
+  const [sessionHistory, setSessionHistory] = useState([]);
+  const [persistentHistory, setPersistentHistory] = useState([]);
   const [dbScriptures, setDbScriptures] = useState([]);
   const [dbLoading, setDbLoading] = useState(true);
   const [todayShloka] = useState(() => SCRIPTURES[new Date().getDate() % SCRIPTURES.length]);
+
+  const deviceId = useMemo(() => {
+    let id = localStorage.getItem("dharma_device_id");
+    if (!id) {
+      id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem("dharma_device_id", id);
+    }
+    return id;
+  }, []);
 
   // Guide state
   const [messages, setMessages] = useState([]);
@@ -712,6 +921,7 @@ export default function DharmaApp() {
   // Scripture browser state
   const [familyFilter, setFamilyFilter] = useState("all");
   const [selectedScripture, setSelectedScripture] = useState(null);
+  const [textsPage, setTextsPage] = useState(1);
 
   // Meditate state
   const [activeSession, setActiveSession] = useState(null);
@@ -759,6 +969,10 @@ export default function DharmaApp() {
     loadScriptures();
   }, []);
 
+  useEffect(() => {
+    loadHistory(supabase, deviceId).then(setPersistentHistory);
+  }, [deviceId]);
+
   const sendMessage = async (text) => {
     const question = text || inputText.trim();
     if (!question || isLoading) return;
@@ -767,11 +981,16 @@ export default function DharmaApp() {
     setIsLoading(true);
 
     try {
-      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile);
+      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile, sessionHistory, persistentHistory);
+
+      const historyEntry = { question, sources: (scriptures || []).map(p => p.book_name).join(", ") || "" };
+      setSessionHistory(prev => [...prev.slice(-4), historyEntry]);
+      saveToHistory(supabase, deviceId, question, reply, scriptures || [], selectedMood);
+
       const assistantMessage = {
         type: "assistant",
         text: reply,
-        scriptures,
+        scriptures: scriptures || [],
         passages: scriptures || [],
       };
       setMessages(prev => [...prev, assistantMessage]);
@@ -811,7 +1030,25 @@ export default function DharmaApp() {
     })
     .filter(s => s.english_translation && s.english_translation.length > 30);
 
-  const hour = new Date().getHours();
+  const scripturePageSize = 20;
+  const scriptureTotalPages = Math.max(1, Math.ceil(filteredScriptures.length / scripturePageSize));
+  const scripturePage = Math.min(textsPage, scriptureTotalPages);
+  const visibleScriptures = filteredScriptures.slice((scripturePage - 1) * scripturePageSize, scripturePage * scripturePageSize);
+
+  useEffect(() => {
+    setTextsPage(1);
+  }, [familyFilter]);
+
+  const now = new Date();
+  const hour = now.getHours();
+  const currentTimeText = now.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
+  const timeTheme = (() => {
+    if (hour >= 4 && hour < 6) return { key: "brahma", bg1: "#120914", bg2: "#1b0e2d", glow: "rgba(180,120,255,0.25)", sun: "#d9b35d" };
+    if (hour >= 6 && hour < 8) return { key: "sunrise", bg1: "#180a00", bg2: "#7d2a00", glow: "rgba(255,142,52,0.38)", sun: "#ffb84d" };
+    if (hour >= 8 && hour < 16) return { key: "day", bg1: "#081628", bg2: "#0d2a48", glow: "rgba(255,217,124,0.25)", sun: "#ffd840" };
+    if (hour >= 16 && hour < 18 + 30/60) return { key: "sunset", bg1: "#160800", bg2: "#9f3414", glow: "rgba(240,133,70,0.32)", sun: "#ffb04d" };
+    return { key: "night", bg1: "#000508", bg2: "#08101e", glow: "rgba(187,212,255,0.15)", sun: "#d4c060" };
+  })();
   const greeting = hour < 12 ? (lang === 'hi' ? 'सुप्रभात' : 'Good morning') : hour < 17 ? (lang === 'hi' ? 'नमस्ते' : 'Good afternoon') : (lang === 'hi' ? 'शुभ संध्या' : 'Good evening');
   const welcomeName = profile?.name || (lang === 'hi' ? 'साधक' : 'seeker');
   const t = { tabs: { sadhana: lang === 'hi' ? 'साधना' : 'Sadhana' } };
@@ -843,7 +1080,16 @@ export default function DharmaApp() {
   return (
     <>
       <style>{styles}</style>
-      <div className="app">
+      <div
+        className={`app ${timeTheme.key}`}
+        style={{
+          background: `linear-gradient(180deg, ${timeTheme.bg1} 0%, ${timeTheme.bg2} 100%)`,
+          transition: 'background 0.8s ease',
+        }}
+      >
+        <div className={`time-sky ${timeTheme.key}`} />
+        <div className={`time-sun ${timeTheme.key}`} />
+        <div className={`time-glow ${timeTheme.key}`} />
 
         {/* ── Nav ── */}
         <div className="nav">
@@ -862,28 +1108,45 @@ export default function DharmaApp() {
         {tab === "home" && (
           <div className="screen">
             <div className="greeting">{`${greeting}, ${welcomeName}`}{lang === 'hi' ? '।' : '.'}</div>
-            <div className="greeting-sub">{new Date().toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long"})}</div>
-
-            <div className="stats-bar">
-              <div className="stat-pill"><span>{SCRIPTURES.length}</span>{lang === 'hi' ? 'श्लोक' : 'scriptures'}</div>
-              <div className="stat-pill"><span>6</span>{lang === 'hi' ? 'पवित्र ग्रंथ' : 'sacred texts'}</div>
-              <div className="stat-pill"><span>ॐ</span>{lang === 'hi' ? 'दर्शन मार्ग' : 'sacred wisdom'}</div>
+            <div className="greeting-sub">
+              <span>{new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</span>
+              <span style={{ marginLeft: 8, opacity: 0.8 }}>• {currentTimeText}</span>
             </div>
 
             {/* Daily shloka */}
-            <div className="shloka-card">
+            <div
+              className="shloka-card"
+              onClick={() => {
+                setTab("guide");
+                setTimeout(() => {
+                  const shlokaQuestion = `Can you explain today's shloka in depth?\n${todayShloka?.verse_sanskrit || todayShloka?.sanskrit_text || ''}\n${todayShloka?.translation || todayShloka?.english_translation || ''}\nSource: ${todayShloka?.source || todayShloka?.book_name || 'Bhagavad Gita'}`;
+                  sendMessage(shlokaQuestion);
+                }, 300);
+              }}
+              style={{ cursor: 'pointer' }}
+            >
               <div className="shloka-label">{lang === 'hi' ? 'आज का श्लोक' : "Today's shloka"}</div>
               <div className="shloka-verse">{todayShloka.verse_sanskrit}</div>
               <div className="shloka-transliteration">{todayShloka.transliteration}</div>
               <div className="shloka-translation">{todayShloka.translation}</div>
               <div className="shloka-source">— {todayShloka.source}</div>
             </div>
+            <div style={{
+              textAlign: 'center',
+              fontSize: 11,
+              color: 'rgba(200,140,60,0.5)',
+              letterSpacing: '1px',
+              marginTop: 8,
+              fontFamily: 'Inter, sans-serif',
+            }}>
+              TAP TO EXPLORE IN GUIDE →
+            </div>
 
             {/* Mood */}
             <div className="section-title">{lang === 'hi' ? 'आप कैसा महसूस कर रहे हैं?' : 'How are you feeling?'}</div>
             <div className="mood-grid">
               {MOODS.map(m => (
-                <button key={m.value} className={`mood-btn ${selectedMood===m.value?"selected":""}`} onClick={() => setSelectedMood(m.value)}>
+                <button key={m.value} className={`mood-btn ${selectedMood===m.value?"selected":""}`} onClick={() => setSelectedMood(prev => prev === m.value ? null : m.value)}>
                   <span className="mood-emoji">{m.emoji}</span>
                   <span className="mood-label">{m.label}</span>
                 </button>
@@ -914,17 +1177,38 @@ export default function DharmaApp() {
                 <div className="quick-name">{lang === 'hi' ? 'आध्यात्मिक मार्गदर्शक' : 'Spiritual guide'}</div>
                 <div className="quick-desc">{lang === 'hi' ? 'जीवन के सवाल पूछें और संतुलित मार्गदर्शन प्राप्त करें' : 'Ask life questions and receive grounded guidance'}</div>
               </div>
-              <div className="quick-card" onClick={() => setTab("texts")}>
-                <span className="quick-icon">ॐ</span>
-                <div className="quick-name">{lang === 'hi' ? 'पवित्र ग्रंथ' : 'Sacred texts'}</div>
-                <div className="quick-desc">{lang === 'hi' ? '6 ग्रंथों में से ' + SCRIPTURES.length + '+ श्लोक देखें' : `Browse ${SCRIPTURES.length}+ verses across 6 texts`}</div>
-              </div>
               <div className="quick-card" onClick={() => { setTab("guide"); sendMessage("What is my dharma? How do I find my purpose?"); }}>
                 <span className="quick-icon">❀</span>
                 <div className="quick-name">{lang === 'hi' ? 'अपना धर्म खोजें' : 'Find your dharma'}</div>
                 <div className="quick-desc">{lang === 'hi' ? 'स्पष्टता के साथ उद्देश्य और मार्ग पर चिंतन करें' : 'Reflect on purpose and path with clarity'}</div>
               </div>
             </div>
+
+            <button
+              onClick={() => {
+                if (window.confirm('Reset all data? This clears your profile, streak, and history.')) {
+                  localStorage.removeItem('dharma_profile');
+                  localStorage.removeItem('dharma_lang');
+                  localStorage.removeItem('dharma_sadhana');
+                  localStorage.removeItem('dharma_device_id');
+                  window.location.reload();
+                }
+              }}
+              style={{
+                background: 'none',
+                border: '0.5px solid rgba(255,80,80,0.2)',
+                borderRadius: 8,
+                padding: '8px 16px',
+                color: 'rgba(255,80,80,0.4)',
+                fontSize: 11,
+                cursor: 'pointer',
+                fontFamily: 'Inter, sans-serif',
+                letterSpacing: '1px',
+                marginTop: 16,
+              }}
+            >
+              ↺ Reset App Data
+            </button>
           </div>
         )}
 
@@ -933,9 +1217,6 @@ export default function DharmaApp() {
           <div className="chat-screen">
             <div className="chat-header">
               <div className="section-title">Spiritual guide</div>
-              <div style={{fontFamily:"'Crimson Pro',serif",fontSize:15,color:"#8a7a60",fontStyle:"italic"}}>
-                {lang === 'hi' ? `${SCRIPTURES.length}+ पवित्र श्लोकों से प्राप्त उत्तर` : `Answers drawn from ${SCRIPTURES.length}+ sacred verses`}
-              </div>
             </div>
 
             <div className="chat-area">
@@ -956,38 +1237,29 @@ export default function DharmaApp() {
                   <div className={`bubble ${msg.type}`}>
                     {msg.type === "assistant" ? <RichText text={msg.text} /> : msg.text}
                   </div>
-                  {msg.type === "assistant" && (msg.scriptures?.length > 0 || msg.passages?.length > 0) && (
-                    <>
-                      <div className="scripture-chips">
-                        {(msg.scriptures || msg.passages || []).map((s, idx) => (
-                          <span key={s.id || `${s.book_name || 'verse'}-${idx}`} className="scripture-chip" onClick={() => { setTab("texts"); setSelectedScripture(s); }}>{s.source || `${s.book_name || 'Scripture'}${s.chapter ? ` ${s.chapter}` : ''}${s.verse_number ? `.${s.verse_number}` : ''}`}</span>
-                        ))}
-                      </div>
-
-                      <div style={{ display: 'flex', gap: 8, marginTop: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
-                        {(msg.passages || msg.scriptures || []).slice(0, 3).map((p, idx) => (
-                          p.sanskrit_text || p.english_translation ? (
-                            <button
-                              key={idx}
-                              onClick={() => setSharePassage(p)}
-                              style={{
-                                background: 'rgba(200,140,60,0.1)',
-                                border: '0.5px solid rgba(200,140,60,0.3)',
-                                borderRadius: 8,
-                                padding: '6px 12px',
-                                color: '#c88c3c',
-                                fontSize: 11,
-                                cursor: 'pointer',
-                                fontFamily: 'Inter, sans-serif',
-                                letterSpacing: '0.5px',
-                              }}
-                            >
-                              📤 Share {p.book_name?.includes('Gita') ? 'Gita' : 'Mahabharata'} verse
-                            </button>
-                          ) : null
-                        ))}
-                      </div>
-                    </>
+                  {msg.type === 'assistant' && msg.scriptures && msg.scriptures.length > 0 && (
+                    <div style={{display:'flex', gap:8, marginTop:8, justifyContent:'center', flexWrap:'wrap'}}>
+                      {msg.scriptures.slice(0, 3).map((p, i) => (
+                        p.sanskrit_text || (p.english_translation && p.english_translation.length > 100) ? (
+                          <button
+                            key={i}
+                            onClick={() => setSharePassage(p)}
+                            style={{
+                              background: 'rgba(200,140,60,0.1)',
+                              border: '0.5px solid rgba(200,140,60,0.3)',
+                              borderRadius: 8,
+                              padding: '6px 12px',
+                              color: '#c88c3c',
+                              fontSize: 11,
+                              cursor: 'pointer',
+                              fontFamily: 'Inter, sans-serif',
+                            }}
+                          >
+                            📤 {p.book_name?.includes('Gita') ? 'Share Gita verse' : 'Share passage'}
+                          </button>
+                        ) : null
+                      ))}
+                    </div>
                   )}
                 </div>
               ))}
@@ -1059,11 +1331,11 @@ export default function DharmaApp() {
                 <div className="section-title">{lang === 'hi' ? 'पवित्र ग्रंथ' : 'Sacred texts'}</div>
                 <div className="filter-row">
                   {FAMILIES.map(f => (
-                    <button key={f.key} className={`filter-btn ${familyFilter===f.key?"active":""}`} onClick={()=>setFamilyFilter(f.key)}>{f.label}</button>
+                    <button key={f.key} className={`filter-btn ${familyFilter===f.key?"active":""}`} onClick={()=>{ setFamilyFilter(f.key); setTextsPage(1); }}>{f.label}</button>
                   ))}
                 </div>
                 <div style={{fontSize:12,color:"#4a4030",marginBottom:8}}>{filteredScriptures.length} verses</div>
-                {filteredScriptures.map(s => (
+                {visibleScriptures.map(s => (
                   <div key={s.id} className="scripture-entry" onClick={() => setSelectedScripture(s)}>
                     <div className="scripture-entry-source">
                       {s.book_name}
@@ -1089,6 +1361,45 @@ export default function DharmaApp() {
                     </button>
                   </div>
                 ))}
+                {scriptureTotalPages > 1 && (
+                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 16, paddingBottom: 8 }}>
+                    <button
+                      onClick={() => setTextsPage(p => Math.max(1, p - 1))}
+                      disabled={scripturePage === 1}
+                      style={{
+                        background: 'rgba(200,140,60,0.1)',
+                        border: '0.5px solid rgba(200,140,60,0.2)',
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        color: '#b6732a',
+                        cursor: scripturePage === 1 ? 'not-allowed' : 'pointer',
+                        opacity: scripturePage === 1 ? 0.5 : 1,
+                        fontFamily: 'Inter, sans-serif',
+                      }}
+                    >
+                      Prev
+                    </button>
+                    <span style={{ fontSize: 12, color: '#4a4030', fontFamily: 'Inter, sans-serif' }}>
+                      Page {scripturePage} / {scriptureTotalPages}
+                    </span>
+                    <button
+                      onClick={() => setTextsPage(p => Math.min(scriptureTotalPages, p + 1))}
+                      disabled={scripturePage === scriptureTotalPages}
+                      style={{
+                        background: 'rgba(200,140,60,0.1)',
+                        border: '0.5px solid rgba(200,140,60,0.2)',
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        color: '#b6732a',
+                        cursor: scripturePage === scriptureTotalPages ? 'not-allowed' : 'pointer',
+                        opacity: scripturePage === scriptureTotalPages ? 0.5 : 1,
+                        fontFamily: 'Inter, sans-serif',
+                      }}
+                    >
+                      Next
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>
