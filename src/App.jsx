@@ -548,7 +548,7 @@ const styles = `
     letter-spacing: -0.02em;
   }
   .greeting-sub {
-    font-size: 12px; color: var(--text-muted); margin-bottom: 24px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; line-height: 1.6;
+    font-size: 12px; color: var(--text-muted); margin-bottom: 24px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; line-height: 1.6; text-align: center;
   }
 
   .time-sky {
@@ -1049,7 +1049,13 @@ export default function DharmaApp() {
     if (hour >= 16 && hour < 18 + 30/60) return { key: "sunset", bg1: "#160800", bg2: "#9f3414", glow: "rgba(240,133,70,0.32)", sun: "#ffb04d" };
     return { key: "night", bg1: "#000508", bg2: "#08101e", glow: "rgba(187,212,255,0.15)", sun: "#d4c060" };
   })();
-  const greeting = hour < 12 ? (lang === 'hi' ? 'सुप्रभात' : 'Good morning') : hour < 17 ? (lang === 'hi' ? 'नमस्ते' : 'Good afternoon') : (lang === 'hi' ? 'शुभ संध्या' : 'Good evening');
+  const greeting = hour >= 5 && hour < 12
+    ? (lang === 'hi' ? 'सुप्रभात' : 'Good morning')
+    : hour >= 12 && hour < 17
+      ? (lang === 'hi' ? 'नमस्ते' : 'Good afternoon')
+      : hour >= 17 && hour < 20
+        ? (lang === 'hi' ? 'शुभ संध्या' : 'Good evening')
+        : (lang === 'hi' ? 'शुभ रात्रि' : 'Good night');
   const welcomeName = profile?.name || (lang === 'hi' ? 'साधक' : 'seeker');
   const t = { tabs: { sadhana: lang === 'hi' ? 'साधना' : 'Sadhana' } };
   const navItems = lang === 'hi'
