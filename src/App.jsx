@@ -1,10 +1,11 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import Onboarding from "./Onboarding.jsx";
 import SadhanaTracker from "./SadhanaTracker.jsx";
 import ShareCard from "./ShareCard.jsx";
 import { SCRIPTURES, findRelevantScriptures } from "./scriptures.js";
+import { useTimeTheme } from './useTimeTheme.js';
 
 // ── DEV MODE — set to false before pushing to production ──
 const DEV_MODE = false;
@@ -47,10 +48,11 @@ const openaiClient = new OpenAI({
 
 async function saveToHistory(supabaseClient, deviceId, question, answer, passages, mood) {
   try {
+    console.log("  3. Saved to conversation_history:", passages.map(p => p.book_name).join(", "));
     await supabaseClient.from("conversation_history").insert({
       device_id: deviceId,
-      question: question.slice(0, 500),
-      answer: answer.slice(0, 1000),
+      question: question.slice(0, 800),
+      answer: answer.slice(0, 2500),
       sources: passages.map(p => p.book_name).join(", "),
       mood: mood || "",
       verses_shown: passages.map(p =>
@@ -261,6 +263,18 @@ function buildScriptureContext(passages) {
   return `\n\nRELEVANT SCRIPTURE PASSAGES:\n\n${entries}\n\n════════════════\n\nINSTRUCTIONS FOR USING THESE PASSAGES:\n- Always quote the Sanskrit (Devanagari) text first when available\n- Then provide the English translation\n- Cite the source exactly as given above\n- Do NOT show IAST (Latin letters with diacritics like ā, ī, ṛ) to the user\n- If Sanskrit is present, always include it in your response`;
 }
 
+// Lightweight passage formatter for the chapter-reading Q&A panel — unlike
+// buildScriptureContext, it deliberately omits exact verse/chapter citation
+// instructions since that context should be paraphrased, not cited precisely.
+function formatRetrievedPassages(passages) {
+  if (!passages || passages.length === 0) return "(no additional passages found)";
+  return passages.map(p => {
+    const source = p.book_name || "Unknown source";
+    const text = (p.english_translation || "").trim();
+    return `From ${source}: ${text}`;
+  }).join("\n\n");
+}
+
 // ── Daily shloka rotates by day ───────────────────────────────────────────────
 const MOODS = [
   { label: "Anxious",   emoji: "◌", value: "anxiety" },
@@ -276,7 +290,7 @@ const MOODS = [
 // ── Grok API ──────────────────────────────────────────────────────────────────
 const GROK_API_KEY = import.meta.env.VITE_GROK_API_KEY || "";
 
-async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null, sessionHistory = [], persistentHistory = []) {
+async function askSpiritualGuide(question, mood, conversationHistory, lang = "en", profile = null, sessionHistory = [], persistentHistory = [], queryMode = "guide") {
   // DEV MODE — skip API calls for UI testing
   if (DEV_MODE) {
     await new Promise(r => setTimeout(r, 500));
@@ -286,6 +300,9 @@ async function askSpiritualGuide(question, mood, conversationHistory, lang = "en
   const relevant = await searchScriptures(question, mood, 10);
   const reranked = await rerankPassages(question, relevant, lang);
   const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
+  console.log("RETRIEVAL CHAIN for:", JSON.stringify(question).slice(0, 80));
+  console.log("  1. Raw retrieved (" + relevant.length + "):", relevant.map(p => p.book_name).join(", "));
+  console.log("  2. After rerank (" + bestPassages.length + "):", bestPassages.map(p => p.book_name).join(", "));
   const scriptureContext = buildScriptureContext(bestPassages);
   const langInstruction = lang === "hi"
     ? "\nIMPORTANT: Respond ENTIRELY in Hindi (Devanagari script). Keep Sanskrit verses in Sanskrit but give ALL explanations in Hindi. Do not use English except for source references like 'Bhagavad Gita 2.47'.\n"
@@ -439,6 +456,51 @@ Total length: 150-250 words for emotional questions. Up to 350 for philosophical
 Never longer than this.
 
 ${scriptureContext}`;
+  // Textual mode: user is exploring a passage, not seeking personal guidance
+  if (queryMode === "textual") {
+    const textualSystemPrompt = `You are Dharma — a knowledgeable guide to Hindu scripture and epic literature. The user is reading a specific passage or chapter and wants to understand it better — narratively, historically, or philosophically. They are NOT asking for a life lesson right now.
+
+USER PROFILE:
+Name: ${userName}
+Background: ${userBackground}
+Language: ${lang === 'hi' ? 'Respond entirely in Hindi (Devanagari). Keep Sanskrit as Sanskrit.' : 'Respond in English.'}
+
+YOUR ROLE:
+- Explain what is happening narratively in this passage (who, what, why)
+- Draw out the dharmic or philosophical themes present in the actual text
+- Mention related characters, events, or other parvas for context if relevant
+- DO NOT project personal emotions onto the user
+- DO NOT immediately leap to a life lesson unless they ask
+- End with a question that invites them deeper into the text, not into self-reflection
+
+VOICE: Engaged, curious, knowledgeable — like a scholar-friend who loves this epic.
+
+ADAPT TO BACKGROUND:
+- beginner: explain who the characters are, keep narrative clear, minimal Sanskrit
+- practising: assume they know the main characters, go into themes and dharmic tension
+- scholarly: full depth — intertextual references, philosophical schools, original Sanskrit
+
+Length: 150–300 words. Narrative first, themes second, one question at end.
+
+${scriptureContext}`;
+    const textualMessages = [
+      { role: "system", content: textualSystemPrompt },
+      ...conversationHistory,
+      { role: "user", content: question },
+    ];
+    const textualResponse = await fetch("https://api.x.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${import.meta.env.VITE_GROK_API_KEY}`,
+      },
+      body: JSON.stringify({ model: "grok-4.5", max_tokens: 1000, messages: textualMessages }),
+    });
+    const textualData = await textualResponse.json();
+    if (textualData.error) throw new Error(textualData.error.message);
+    return { reply: textualData.choices[0].message.content, scriptures: bestPassages };
+  }
+
   const messages = [
     { role: "system", content: systemPrompt },
     ...conversationHistory,
@@ -493,7 +555,7 @@ const styles = `
     position: relative; overflow: hidden;
     box-shadow: 0 0 0 1px rgba(18, 30, 25, 0.04), 0 18px 40px rgba(45, 53, 46, 0.08);
     color: var(--text-main);
-    background: linear-gradient(180deg, #071018 0%, #0c1f2d 100%);
+    background: linear-gradient(180deg, #040810 0%, #081220 100%);
   }
   .app::before {
     content: ''; position: fixed; top: -100px; left: 50%; transform: translateX(-50%);
@@ -502,9 +564,9 @@ const styles = `
     pointer-events: none; z-index: 0;
   }
   .app.brahma { --panel-tint: rgba(21, 13, 24, 0.62); --panel-soft: rgba(255,255,255,0.07); --accent: #d9b36b; --text-soft: #f0d9af; }
-  .app.sunrise { --panel-tint: rgba(47, 20, 7, 0.52); --panel-soft: rgba(255,255,255,0.08); --accent: #f3b76c; --text-soft: #f9d7af; }
-  .app.day { --panel-tint: rgba(10, 27, 39, 0.44); --panel-soft: rgba(255,255,255,0.1); --accent: #f8d77d; --text-soft: #e7ecea; }
-  .app.sunset { --panel-tint: rgba(50, 18, 7, 0.52); --panel-soft: rgba(255,255,255,0.08); --accent: #ffaf6c; --text-soft: #f7d5b9; }
+  .app.sunrise { --panel-tint: rgba(20,8,0,0.60); --panel-soft: rgba(255,255,255,0.07); --accent: #ffaa44; --text-soft: #ffc878; }
+  .app.day { --panel-tint: rgba(5,20,40,0.58); --panel-soft: rgba(255,255,255,0.08); --accent: #60b8ff; --text-soft: #90c8f0; }
+  .app.sunset { --panel-tint: rgba(18,4,0,0.60); --panel-soft: rgba(255,255,255,0.07); --accent: #ff9a38; --text-soft: #ffb860; }
   .app.night { --panel-tint: rgba(5, 12, 18, 0.66); --panel-soft: rgba(255,255,255,0.06); --accent: #d9c48a; --text-soft: #dfe8f6; }
 
   /* Nav */
@@ -548,7 +610,7 @@ const styles = `
     letter-spacing: -0.02em;
   }
   .greeting-sub {
-    font-size: 12px; color: var(--text-muted); margin-bottom: 24px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; line-height: 1.6; text-align: center;
+    font-size: 12px; color: var(--text-soft); margin-bottom: 24px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; line-height: 1.6; text-align: center;
   }
 
   .time-sky {
@@ -665,7 +727,7 @@ const styles = `
 
   /* Stats bar */
   .stats-bar { display: flex; gap: 10px; margin-bottom: 20px; }
-  .stat-pill { background: rgba(255,255,255,0.56); border: 1px solid rgba(41,74,63,0.08); border-radius: 20px; padding: 8px 14px; font-size: 12px; color: #5b6b66; }
+  .stat-pill { background: rgba(255,255,255,0.12); border: 1px solid rgba(41,74,63,0.08); border-radius: 20px; padding: 8px 14px; font-size: 12px; color: var(--text-main); }
   .stat-pill span { color: #a86d2a; font-weight: 700; margin-right: 4px; }
 
   /* Chat */
@@ -674,9 +736,9 @@ const styles = `
   .chat-area { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding-bottom: 16px; }
   .chat-empty { text-align: center; padding: 30px 20px; }
   .chat-empty-symbol { font-size: 36px; margin-bottom: 12px; opacity: 0.5; }
-  .chat-empty-text { font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; font-size: 16px; color: #4d5f58; line-height: 1.7; margin-bottom: 20px; }
+  .chat-empty-text { font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; font-size: 16px; color: var(--text-soft); line-height: 1.7; margin-bottom: 20px; }
   .starter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .starter-btn { background: rgba(255,255,255,0.52); border: 1px solid rgba(41,74,63,0.08); border-radius: 10px; padding: 10px 12px; cursor: pointer; text-align: left; color: #425c57; font-size: 12px; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; transition: all 0.2s; line-height: 1.5; }
+  .starter-btn { background: rgba(255,255,255,0.10); border: 1px solid rgba(41,74,63,0.08); border-radius: 10px; padding: 10px 12px; cursor: pointer; text-align: left; color: var(--text-main); font-size: 12px; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif; transition: all 0.2s; line-height: 1.5; }
   .starter-btn:hover { border-color: rgba(110,166,128,0.3); color: #20493f; }
 
   .message { display: flex; flex-direction: column; gap: 4px; }
@@ -684,14 +746,14 @@ const styles = `
   .message.assistant { align-items: flex-start; }
 
   .bubble { max-width: 88%; padding: 12px 16px; border-radius: 16px; font-size: 14px; line-height: 1.7; }
-  .bubble.user { background: rgba(166,109,43,0.1); border: 1px solid rgba(166,109,43,0.18); color: #1f302c; border-bottom-right-radius: 4px; }
-  .bubble.assistant { background: rgba(255,255,255,0.64); border: 1px solid rgba(41,74,63,0.08); color: #1a352f; font-family: 'Noto Sans Devanagari', 'Crimson Pro', serif; font-size: 16px; border-bottom-left-radius: 4px; white-space: pre-wrap; }
+  .bubble.user { background: rgba(255,255,255,0.14); border: 1px solid rgba(255,200,120,0.30); color: var(--text-main); border-bottom-right-radius: 4px; }
+  .bubble.assistant { background: rgba(255,255,255,0.93); border: 1px solid rgba(41,74,63,0.12); color: #12261f; font-family: 'Noto Sans Devanagari', 'Crimson Pro', serif; font-size: 16px; border-bottom-left-radius: 4px; white-space: pre-wrap; }
   .bubble.assistant em { color: #a56d2b; font-style: italic; }
   .scripture-block { display: block; margin: 10px 0; }
   .scripture-label { color: #8a6a3d; font-weight: 600; }
-  .scripture-sanskrit { display: block; margin-top: 6px; color: #7a5b31; font-family: 'Crimson Pro', serif; font-style: italic; font-weight: 500; line-height: 1.8; }
-  .scripture-sanskrit-text { display: block; white-space: pre-wrap; color: #7a5b31; font-family: 'Crimson Pro', serif; font-style: italic; }
-  .scripture-translation { color: #23433a; line-height: 1.7; }
+  .scripture-sanskrit { display: block; margin-top: 6px; color: #f5f0e8; font-family: 'Crimson Pro', serif; font-style: italic; font-weight: 500; line-height: 1.8; }
+  .scripture-sanskrit-text { display: block; white-space: pre-wrap; color: #f5f0e8; font-family: 'Crimson Pro', serif; font-style: italic; }
+  .scripture-translation { color: var(--text-main); line-height: 1.7; }
   .scripture-source { margin-top: 8px; font-size: 12px; color: #7d6f62; letter-spacing: 0.3px; line-height: 1.5; font-style: italic; }
 
   /* Scripture chips shown after response */
@@ -705,37 +767,39 @@ const styles = `
   @keyframes typingBounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)} }
 
   .chat-input-area { display: flex; gap: 10px; padding-top: 14px; border-top: 1px solid rgba(41,74,63,0.08); }
-  .chat-input { flex: 1; background: rgba(255,255,255,0.56); border: 1px solid rgba(41,74,63,0.08); border-radius: 12px; padding: 12px 14px; color: #1d312b; font-size: 14px; font-family: 'Inter', sans-serif; resize: none; outline: none; transition: border-color 0.2s; line-height: 1.5; min-height: 46px; max-height: 120px; }
+  .chat-input { flex: 1; background: rgba(255,255,255,0.10); border: 1px solid rgba(41,74,63,0.08); border-radius: 12px; padding: 12px 14px; color: var(--text-main); font-size: 14px; font-family: 'Inter', sans-serif; resize: none; outline: none; transition: border-color 0.2s; line-height: 1.5; min-height: 46px; max-height: 120px; }
   .chat-input:focus { border-color: rgba(166,109,43,0.35); }
-  .chat-input::placeholder { color: #73877f; }
+  .chat-input::placeholder { color: var(--text-muted); }
   .send-btn { background: linear-gradient(135deg, #a56d2b 0%, #d8b15a 100%); border: none; border-radius: 12px; width: 46px; height: 46px; cursor: pointer; display: flex; align-items: center; justify-content: center; color: #fffaf2; font-size: 18px; transition: all 0.2s; flex-shrink: 0; }
   .send-btn:hover { filter: brightness(1.04); }
   .send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 
   /* Scripture browser */
-  .scripture-browser { display: flex; flex-direction: column; gap: 12px; }
+  .scripture-browser { display: flex; flex-direction: column; gap: 8px; }
   .filter-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
   .filter-row::-webkit-scrollbar { display: none; }
-  .filter-btn { background: rgba(255,255,255,0.52); border: 1px solid rgba(41,74,63,0.08); border-radius: 16px; padding: 6px 14px; font-size: 12px; color: #5b6b66; cursor: pointer; white-space: nowrap; transition: all 0.2s; font-family: 'Inter', sans-serif; }
+  .filter-btn { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.18); border-radius: 16px; padding: 6px 14px; font-size: 12px; color: var(--text-main); cursor: pointer; white-space: nowrap; transition: all 0.2s; font-family: 'Inter', sans-serif; }
   .filter-btn.active { background: rgba(166,109,43,0.08); border-color: rgba(166,109,43,0.18); color: #a56d2b; }
 
-  .scripture-entry { background: rgba(255,255,255,0.52); border: 1px solid rgba(41,74,63,0.08); border-radius: 14px; padding: 18px; cursor: pointer; transition: all 0.2s; }
+  .scripture-entry { position: relative; background: rgba(255,255,255,0.90); border: 1px solid rgba(41,74,63,0.12); border-radius: 12px; padding: 12px 36px 12px 14px; cursor: pointer; transition: all 0.2s; }
   .scripture-entry:hover { border-color: rgba(110,166,128,0.25); background: rgba(110,166,128,0.04); }
-  .scripture-entry-source { font-size: 10px; letter-spacing: 1.5px; color: #a56d2b; text-transform: uppercase; margin-bottom: 10px; }
-  .scripture-entry-verse { font-family: 'Crimson Pro', serif; font-size: 16px; color: #18342d; line-height: 1.5; margin-bottom: 8px; }
-  .scripture-entry-translation { font-size: 13px; color: #536b64; line-height: 1.6; margin-bottom: 10px; }
+  .scripture-entry-source { font-size: 9px; letter-spacing: 1.2px; color: #a56d2b; text-transform: uppercase; margin-bottom: 6px; }
+  .scripture-entry-verse { font-family: 'Crimson Pro', serif; font-size: 14px; color: #0e2218; line-height: 1.4; margin-bottom: 5px; }
+  .scripture-entry-translation { font-size: 12px; color: #2a4a42; line-height: 1.45; margin-bottom: 0; }
+  .scripture-entry-share-btn { position: absolute; top: 10px; right: 10px; background: none; border: none; padding: 4px; font-size: 13px; line-height: 1; color: rgba(200,140,60,0.7); cursor: pointer; opacity: 0.7; transition: opacity 0.2s; }
+  .scripture-entry-share-btn:hover { opacity: 1; }
   .scripture-entry-tags { display: flex; flex-wrap: wrap; gap: 5px; }
   .tag { font-size: 10px; color: #51716a; background: rgba(255,255,255,0.52); border: 1px solid rgba(41,74,63,0.08); border-radius: 8px; padding: 2px 8px; }
 
   /* Scripture detail */
   .scripture-detail { padding: 4px 0; }
-  .back-btn { background: none; border: none; color: #5c6f69; font-size: 13px; cursor: pointer; font-family: 'Inter', sans-serif; margin-bottom: 20px; display: flex; align-items: center; gap: 6px; }
+  .back-btn { background: none; border: none; color: var(--text-soft); font-size: 13px; cursor: pointer; font-family: 'Inter', sans-serif; margin-bottom: 20px; display: flex; align-items: center; gap: 6px; }
   .detail-source { font-size: 10px; letter-spacing: 2px; color: #a56d2b; text-transform: uppercase; margin-bottom: 16px; }
-  .detail-sanskrit { font-family: 'Crimson Pro', serif; font-size: 22px; color: #1b352f; line-height: 1.6; margin-bottom: 12px; }
-  .detail-transliteration { font-size: 13px; color: #5f6f6a; font-style: italic; margin-bottom: 14px; line-height: 1.6; }
-  .detail-translation { font-size: 16px; color: #1b352f; font-family: 'Crimson Pro', serif; line-height: 1.7; margin-bottom: 20px; padding: 16px; background: rgba(166,109,43,0.06); border-left: 2px solid rgba(166,109,43,0.22); border-radius: 0 8px 8px 0; }
-  .detail-commentary-label { font-size: 10px; letter-spacing: 2px; color: #5c6f69; text-transform: uppercase; margin-bottom: 10px; }
-  .detail-commentary { font-size: 14px; color: #536b64; line-height: 1.8; margin-bottom: 20px; }
+  .detail-sanskrit { font-family: 'Crimson Pro', serif; font-size: 22px; color: #f4efe7; line-height: 1.6; margin-bottom: 12px; }
+  .detail-transliteration { font-size: 13px; color: #f0e7dd; font-style: italic; margin-bottom: 14px; line-height: 1.6; }
+  .detail-translation { font-size: 16px; color: #f7f1ea; font-family: 'Crimson Pro', serif; line-height: 1.7; margin-bottom: 20px; padding: 16px; background: rgba(166,109,43,0.06); border-left: 2px solid rgba(166,109,43,0.22); border-radius: 0 8px 8px 0; }
+  .detail-commentary-label { font-size: 10px; letter-spacing: 2px; color: var(--text-soft); text-transform: uppercase; margin-bottom: 10px; }
+  .detail-commentary { font-size: 14px; color: var(--text-soft); line-height: 1.8; margin-bottom: 20px; }
   .ask-about-btn { background: rgba(166,109,43,0.1); border: 1px solid rgba(166,109,43,0.2); border-radius: 10px; padding: 12px 18px; color: #a56d2b; font-size: 13px; cursor: pointer; font-family: 'Inter', sans-serif; width: 100%; transition: all 0.2s; }
   .ask-about-btn:hover { background: rgba(166,109,43,0.14); }
 
@@ -744,23 +808,23 @@ const styles = `
   .mandala { width: 100px; height: 100px; border-radius: 50%; background: conic-gradient(from 0deg, rgba(200,140,60,0.3), rgba(200,140,60,0.05), rgba(200,140,60,0.3)); margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 36px; animation: rotateSlow 20s linear infinite; border: 0.5px solid rgba(200,140,60,0.2); }
   @keyframes rotateSlow { to { transform: rotate(360deg); } }
   .meditate-title { font-family: 'Crimson Pro', serif; font-size: 24px; font-weight: 300; color: #e8dcc8; margin-bottom: 6px; }
-  .meditate-sub { font-size: 13px; color: #6b5f4a; }
+  .meditate-sub { font-size: 13px; color: var(--text-soft); }
 
   .session-grid { display: flex; flex-direction: column; gap: 10px; }
   .session-card { background: rgba(255,255,255,0.03); border: 0.5px solid rgba(255,255,255,0.07); border-radius: 14px; padding: 18px 20px; display: flex; align-items: center; gap: 16px; cursor: pointer; transition: all 0.2s; }
   .session-card:hover { border-color: rgba(200,140,60,0.3); }
   .session-icon { font-size: 28px; flex-shrink: 0; }
   .session-name { font-size: 15px; color: #c4b48a; font-weight: 500; margin-bottom: 3px; }
-  .session-desc { font-size: 12px; color: #6b5f4a; line-height: 1.5; }
+  .session-desc { font-size: 12px; color: var(--text-soft); line-height: 1.5; }
   .session-dur { font-size: 12px; color: #c88c3c; background: rgba(200,140,60,0.1); padding: 4px 10px; border-radius: 20px; flex-shrink: 0; }
 
   .timer-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 24px; text-align: center; }
   .timer-circle { width: 160px; height: 160px; border-radius: 50%; border: 1px solid rgba(200,140,60,0.3); display: flex; align-items: center; justify-content: center; margin-bottom: 20px; }
   .timer-time { font-family: 'Crimson Pro', serif; font-size: 42px; font-weight: 300; color: #e8dcc8; }
-  .timer-mantra { font-size: 13px; color: #6b5f4a; margin-bottom: 28px; font-family: 'Crimson Pro', serif; font-style: italic; }
+  .timer-mantra { font-size: 13px; color: var(--text-soft); margin-bottom: 28px; font-family: 'Crimson Pro', serif; font-style: italic; }
   .timer-btn { background: rgba(200,140,60,0.15); border: 0.5px solid rgba(200,140,60,0.35); border-radius: 40px; padding: 14px 36px; color: #c88c3c; font-size: 15px; cursor: pointer; transition: all 0.2s; font-family: 'Inter', sans-serif; }
   .timer-btn:hover { background: rgba(200,140,60,0.25); }
-  .back-link { background: none; border: none; color: #6b5f4a; font-size: 13px; cursor: pointer; margin-top: 16px; font-family: 'Inter', sans-serif; }
+  .back-link { background: none; border: none; color: var(--text-soft); font-size: 13px; cursor: pointer; margin-top: 16px; font-family: 'Inter', sans-serif; }
 
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-thumb { background: rgba(200,140,60,0.2); border-radius: 2px; }
@@ -795,7 +859,7 @@ function renderInlineMarkdown(content) {
   return <>{parts}</>;
 }
 
-function RichText({ text }) {
+function RichText({ text, theme }) {
   if (!text) return null;
 
   const lines = String(text).split(/\n/);
@@ -830,7 +894,7 @@ function RichText({ text }) {
       output.push(
         <div key={`sanskrit-${i}`} className="scripture-block scripture-sanskrit">
           <span className="scripture-label">Sanskrit:</span>
-          <span className="scripture-sanskrit-text">{sanskritLines.join("\n")}</span>
+          <span className="scripture-sanskrit-text" style={{ color: theme.textPrimary, opacity: 0.95 }}>{sanskritLines.join("\n")}</span>
         </div>
       );
 
@@ -871,6 +935,223 @@ const SESSIONS = [
   { id: 4, icon: "🧘", name: "Yoga Nidra", desc: "Yogic sleep — deep conscious relaxation", duration: 20, mantra: "Rest between waking and sleep…" },
 ];
 
+function Stars({ opacity = 0.6 }) {
+  const stars = React.useMemo(() => (
+    Array.from({ length: 80 }, (_, i) => ({
+      id: i,
+      x: Math.random() * 100,
+      y: Math.random() * 100,
+      size: Math.random() * 1.5 + 0.5,
+      delay: Math.random() * 4,
+      duration: Math.random() * 3 + 2,
+    }))
+  ), []);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0,
+      pointerEvents: "none", zIndex: 0, opacity,
+    }}>
+      {stars.map(s => (
+        <div key={s.id} style={{
+          position: "absolute",
+          left: `${s.x}%`,
+          top: `${s.y}%`,
+          width: s.size,
+          height: s.size,
+          borderRadius: "50%",
+          background: "white",
+          animation: `twinkle ${s.duration}s ${s.delay}s ease-in-out infinite alternate`,
+        }} />
+      ))}
+      <style>{`
+        @keyframes twinkle {
+          from { opacity: 0.2; transform: scale(0.8); }
+          to   { opacity: 0.9; transform: scale(1.2); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function Celestial({ theme, tab }) {
+  if (tab === 'sadhana') return null;
+  if (!theme.celestialStyle) return null;
+  if (theme.celestial === 'moon-clouds') {
+    // Scattered across the top third of the screen, soft and slow-drifting
+    // so they never clump behind the greeting text on narrow viewports.
+    const clouds = [
+      { left: '6%',  top: '5%',  width: 70, height: 26, opacity: 0.30, blur: 5, duration: 62, delay: -4,  drift: 22 },
+      { left: '30%', top: '13%', width: 90, height: 32, opacity: 0.24, blur: 6, duration: 78, delay: -22, drift: 30 },
+      { left: '58%', top: '4%',  width: 60, height: 22, opacity: 0.28, blur: 4, duration: 55, delay: -12, drift: 18 },
+      { left: '18%', top: '24%', width: 54, height: 20, opacity: 0.20, blur: 5, duration: 70, delay: -34, drift: 20 },
+      { left: '68%', top: '20%', width: 76, height: 28, opacity: 0.24, blur: 5, duration: 88, delay: -46, drift: 26 },
+    ];
+
+    return (
+      <div style={{
+        position: 'fixed',
+        top: 0, left: 0, right: 0,
+        height: '34vh',
+        zIndex: 0,
+        pointerEvents: 'none',
+        overflow: 'hidden',
+      }}>
+        <div style={{
+          position: 'absolute',
+          top: 92,
+          right: 36,
+          width: 42,
+          height: 42,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle at 35% 35%, #fffef8, #e9edf8 52%, #d3d6e8 100%)',
+          boxShadow: '0 0 24px rgba(242,246,255,0.55), 0 0 60px rgba(170,197,255,0.3)',
+        }} />
+        {clouds.map((cloud, index) => (
+          <div key={index} style={{
+            position: 'absolute',
+            left: cloud.left,
+            top: cloud.top,
+            width: cloud.width,
+            height: cloud.height,
+            borderRadius: '50%',
+            background: 'rgba(255,255,255,0.85)',
+            opacity: cloud.opacity,
+            filter: `blur(${cloud.blur}px)`,
+            animation: `cloudDrift ${cloud.duration}s ${cloud.delay}s ease-in-out infinite alternate`,
+            ['--cloud-drift']: `${cloud.drift}px`,
+          }} />
+        ))}
+        <style>{`
+          @keyframes cloudDrift {
+            from { transform: translateX(0); }
+            to   { transform: translateX(var(--cloud-drift)); }
+          }
+        `}</style>
+      </div>
+    );
+  }
+
+  if (theme.celestial === 'sun-high' || theme.celestial === 'sun-rising' || theme.celestial === 'sun-setting') {
+    if (theme.name === 'Ratri' || theme.name === 'Brahma Muhurta') return null;
+  }
+  const isPulsing = theme.celestial === 'sun-rising' || theme.celestial === 'sun-setting';
+  return (
+    <div style={{
+      ...theme.celestialStyle,
+      position: 'fixed',
+      zIndex: 0,
+      pointerEvents: 'none',
+      animation: isPulsing ? 'celestialPulse 4s ease-in-out infinite alternate' : undefined,
+    }}>
+      <style>{`
+        @keyframes celestialPulse {
+          from { transform: scale(0.95); filter: brightness(0.9); }
+          to   { transform: scale(1.05); filter: brightness(1.1); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function Birds({ theme }) {
+  if (!theme || !['sun-rising', 'sun-setting'].includes(theme.celestial)) return null;
+
+  const isSunset = theme.celestial === 'sun-setting';
+  // Bright enough to show against the dark-rich backgrounds
+  const birdColor = isSunset ? '#ffcc88' : '#ffd0a0';
+
+  // Each bird: cx/cy = centre position in the 420×100 viewBox, s = scale
+  const birds = [
+    { cx: 52,  cy: 38, s: 0.55 },
+    { cx: 118, cy: 22, s: 0.42 },
+    { cx: 200, cy: 30, s: 0.62 },
+    { cx: 278, cy: 16, s: 0.38 },
+    { cx: 345, cy: 34, s: 0.48 },
+  ];
+
+  // Faint, shallow open-M silhouette — a soft hint of a wingbeat rather than a bold shape
+  const wingPath = 'M-10,4 C-6,-1 -2,-2 0,0 C2,-2 6,-1 10,4';
+
+  return (
+    <div style={{
+      position: 'fixed',
+      top: 72,       // below the nav bar
+      left: 0,
+      right: 0,
+      height: 120,
+      pointerEvents: 'none',
+      zIndex: 1,     // above orbs (z:0) but below nav (z:10)
+      overflow: 'hidden',
+    }}>
+      <svg
+        viewBox="0 0 420 100"
+        preserveAspectRatio="xMidYMid meet"
+        style={{ width: '100%', height: '100%' }}
+      >
+        {birds.map((b, i) => (
+          <g key={i}>
+            {/* Wrapper g handles position — animation g handles movement */}
+            <g transform={`translate(${b.cx}, ${b.cy}) scale(${b.s})`}>
+              <g>
+                <path
+                  d={wingPath}
+                  fill="none"
+                  stroke={birdColor}
+                  strokeWidth="1.3"
+                  strokeLinecap="round"
+                  opacity="0.4"
+                />
+                <animateTransform
+                  attributeName="transform"
+                  type="translate"
+                  values={`0,0; ${5 + i * 2},${-4 - i}; 0,0`}
+                  keyTimes="0; 0.5; 1"
+                  dur={`${7 + i * 1.8}s`}
+                  begin={`${i * 0.9}s`}
+                  repeatCount="indefinite"
+                  calcMode="spline"
+                  keySplines="0.42 0 0.58 1; 0.42 0 0.58 1"
+                />
+              </g>
+            </g>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function Orbs({ theme }) {
+  return (
+    <>
+      {[theme.orb1, theme.orb2].filter(Boolean).map((orb, i) => (
+        <div key={i} style={{
+          position: "fixed",
+          borderRadius: "50%",
+          background: `radial-gradient(circle, ${orb.color}, transparent 70%)`,
+          width: orb.size,
+          height: orb.size,
+          top: orb.top !== undefined ? orb.top : "auto",
+          bottom: orb.bottom !== undefined ? orb.bottom : "auto",
+          left: orb.left !== undefined ? orb.left : "auto",
+          right: orb.right !== undefined ? orb.right : "auto",
+          pointerEvents: "none",
+          zIndex: 0,
+          filter: "blur(60px)",
+          animation: `orbFloat ${8 + i * 3}s ease-in-out infinite alternate`,
+        }} />
+      ))}
+      <style>{`
+        @keyframes orbFloat {
+          from { transform: translate(0, 0) scale(1); }
+          to   { transform: translate(20px, -20px) scale(1.05); }
+        }
+      `}</style>
+    </>
+  );
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function DharmaApp() {
   const [lang, setLang] = useState(() => localStorage.getItem('dharma_lang') || 'en');
@@ -893,6 +1174,7 @@ export default function DharmaApp() {
     setProfile(nextProfile);
   };
 
+  const theme = useTimeTheme();
   const [tab, setTab] = useState("home");
   const [selectedMood, setSelectedMood] = useState(null);
   const [sharePassage, setSharePassage] = useState(null);
@@ -919,9 +1201,29 @@ export default function DharmaApp() {
   const chatBottomRef = useRef(null);
 
   // Scripture browser state
-  const [familyFilter, setFamilyFilter] = useState("all");
+  const [familyFilter, setFamilyFilter] = useState("Bhagavad Gita");
   const [selectedScripture, setSelectedScripture] = useState(null);
+  const [selectedParva, setSelectedParva] = useState(null);
+  const [selectedParvaBookName, setSelectedParvaBookName] = useState(null); // full book_name, needed for book_content queries
+  const [textMode, setTextMode] = useState("browse"); // "browse" | "parva" | "detail" | "chapters" | "reading"
+  const [parvaList, setParvaList] = useState([]);       // distinct parva names
+  const [parvaVerses, setParvaVerses] = useState([]);   // verses for selected parva
+  const [parvaLoading, setParvaLoading] = useState(false);
+  const [chapterList, setChapterList] = useState([]);   // chapter numbers for selected Mahabharata parva
+  const [selectedChapter, setSelectedChapter] = useState(null);
+  const [chapterText, setChapterText] = useState("");
+  const [chapterLoading, setChapterLoading] = useState(false);
+  const [chapterPage, setChapterPage] = useState(1);     // pagination within the chapter tile grid
+  const [readingPage, setReadingPage] = useState(1);     // "flip page" position within a chapter's text
+  const [chapterChatMessages, setChapterChatMessages] = useState([]); // in-session {role, content} thread for the current chapter
+  const [chapterChatInput, setChapterChatInput] = useState("");
+  const [chapterChatLoading, setChapterChatLoading] = useState(false);
+  const [gitaChatMessages, setGitaChatMessages] = useState([]); // in-session {role, content} thread for the current verse
+  const [gitaChatInput, setGitaChatInput] = useState("");
+  const [gitaChatLoading, setGitaChatLoading] = useState(false);
   const [textsPage, setTextsPage] = useState(1);
+  const [versePage, setVersePage] = useState(1);        // pagination within a chapter/parva
+  const [textsLoaded, setTextsLoaded] = useState(false);
 
   // Meditate state
   const [activeSession, setActiveSession] = useState(null);
@@ -946,34 +1248,254 @@ export default function DharmaApp() {
   }, [timerRunning]);
 
   useEffect(() => {
-    async function loadScriptures() {
+    if (tab !== "texts" || textsLoaded) return;
+
+    async function loadInitialData() {
       try {
-        const { data, error } = await supabase
+        // 1. Load all Gita verses — 701 rows, fits easily
+        const { data: gitaData, error: gitaError } = await supabase
           .from("scriptures")
           .select("id, book_name, chapter, verse_number, sanskrit_text, transliteration, english_translation, hindi_translation")
-          .or("book_name.ilike.%Bhagavad Gita%,book_name.ilike.%Mahabharata%")
+          .ilike("book_name", "%Bhagavad Gita%")
           .not("english_translation", "is", null)
-          .order("book_name", { ascending: true })
-          .order("chapter", { ascending: true })
-          .limit(1000);
+          .order("chapter", { ascending: true });
 
-        if (!error && data) {
-          setDbScriptures(data);
+        if (!gitaError && gitaData) {
+          setDbScriptures(gitaData);
+          console.log("Gita loaded:", gitaData.length, "verses");
         }
+
+        // 2. Load ONLY book_name for Mahabharata — tiny payload, just strings
+        //    This gives us all distinct parva names without hitting row limits
+        const { data: mbData, error: mbError } = await supabase
+          .rpc("get_distinct_parvas");
+
+        if (!mbError && mbData) {
+          const distinctParvas = mbData
+            .map(row => typeof row === 'string' ? row : row.book_name)
+            .filter(Boolean);
+          setParvaList(distinctParvas);
+          console.log("Parvas loaded:", distinctParvas.length, distinctParvas);
+        } else if (mbError) {
+          console.error("Parva RPC error:", mbError.message, mbError);
+        }
+
       } catch (err) {
         console.error("Failed to load scriptures:", err);
       } finally {
         setDbLoading(false);
       }
     }
-    loadScriptures();
-  }, []);
+    loadInitialData().then(() => setTextsLoaded(true));
+  }, [tab, textsLoaded]);
+
+  const loadParvaVerses = async (bookName) => {
+    setParvaLoading(true);
+    setParvaVerses([]);
+    try {
+      const { data, error } = await supabase
+        .from("scriptures")
+        .select("id, book_name, chapter, verse_number, sanskrit_text, transliteration, english_translation, hindi_translation")
+        .eq("book_name", bookName)
+        .not("english_translation", "is", null)
+        .order("chapter", { ascending: true })
+        .range(0, 999);
+
+      if (!error && data) {
+        // Sort verses numerically (verse_number stored as text)
+        const sorted = data.sort((a, b) => {
+          const chA = parseInt(a.chapter) || 0;
+          const chB = parseInt(b.chapter) || 0;
+          if (chA !== chB) return chA - chB;
+          return (parseInt(a.verse_number) || 0) - (parseInt(b.verse_number) || 0);
+        });
+        setParvaVerses(sorted);
+      }
+    } catch (err) {
+      console.error("Failed to load parva verses:", err);
+    } finally {
+      setParvaLoading(false);
+    }
+  };
+
+  const loadChapters = async (bookName) => {
+    setChapterLoading(true);
+    setChapterList([]);
+    try {
+      const { data, error } = await supabase
+        .from("book_content")
+        .select("chapter")
+        .eq("book_name", bookName)
+        .eq("content_type", "chapter_text")
+        .order("chapter", { ascending: true });
+
+      if (!error && data) {
+        setChapterList(data.map(row => row.chapter));
+      } else if (error) {
+        console.error("Failed to load chapters:", error.message, error);
+      }
+    } catch (err) {
+      console.error("Failed to load chapters:", err);
+    } finally {
+      setChapterLoading(false);
+    }
+  };
+
+  const loadChapterText = async (bookName, chapterNum) => {
+    setChapterLoading(true);
+    setChapterText("");
+    try {
+      const { data, error } = await supabase
+        .from("book_content")
+        .select("content")
+        .eq("book_name", bookName)
+        .eq("chapter", chapterNum)
+        .eq("content_type", "chapter_text")
+        .single();
+
+      if (!error && data) {
+        setChapterText(data.content || "");
+      } else if (error) {
+        console.error("Failed to load chapter text:", error.message, error);
+      }
+    } catch (err) {
+      console.error("Failed to load chapter text:", err);
+    } finally {
+      setChapterLoading(false);
+    }
+  };
+
+  const askAboutChapter = async (question) => {
+    const q = (question || "").trim();
+    if (!q || chapterChatLoading) return;
+    setChapterChatInput("");
+    setChapterChatLoading(true);
+    try {
+      // Broad vector search across scriptures — same retrieval used by the Guide tab,
+      // not scoped to the current parva, since the reader may ask about anything.
+      const relevant = await searchScriptures(q, "", 10);
+      const reranked = await rerankPassages(q, relevant, lang);
+      const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
+      console.log("RETRIEVAL CHAIN for:", JSON.stringify(q).slice(0, 80));
+      console.log("  1. Raw retrieved (" + relevant.length + "):", relevant.map(p => p.book_name).join(", "));
+      console.log("  2. After rerank (" + bestPassages.length + "):", bestPassages.map(p => p.book_name).join(", "));
+      const retrievedText = formatRetrievedPassages(bestPassages);
+
+      const systemPrompt = `You are helping a reader understand the Mahabharata while they read a specific chapter. You have two sources of context:
+
+1. CURRENT CHAPTER (the reader is looking at this right now — prioritize this for "what happens here" or "what does this mean" questions):
+${chapterText}
+
+2. ADDITIONAL PASSAGES FROM ELSEWHERE IN THE MAHABHARATA (use these for questions about characters, events, or context beyond the current chapter):
+${retrievedText}
+
+Answer using whichever source(s) are relevant. Prioritize source 1 for questions about the current chapter. Use source 2 for broader context (e.g. "what happens to this character later"). If neither source answers it, say so honestly. For Mahabharata/Ramayana citations from source 2, do not cite exact verse/chapter numbers — paraphrase instead.`;
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...chapterChatMessages,
+        { role: "user", content: q },
+      ];
+
+      const response = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${import.meta.env.VITE_GROK_API_KEY}`,
+        },
+        body: JSON.stringify({ model: "grok-4.5", max_tokens: 700, messages }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      const answer = data.choices?.[0]?.message?.content || "";
+
+      setChapterChatMessages(prev => [...prev, { role: "user", content: q }, { role: "assistant", content: answer }]);
+
+      console.log("  3. Saved to mahabharata_chapter_chat_history:", bestPassages.map(p => p.book_name).join(", "));
+      await supabase.from("mahabharata_chapter_chat_history").insert({
+        device_id: deviceId,
+        book_name: selectedParvaBookName,
+        chapter: selectedChapter,
+        question: q,
+        answer,
+      });
+    } catch (err) {
+      console.error("askAboutChapter failed:", err);
+      setChapterChatMessages(prev => [...prev, { role: "user", content: q }, { role: "assistant", content: "Sorry, I couldn't find an answer to that just now." }]);
+    } finally {
+      setChapterChatLoading(false);
+    }
+  };
+
+  const askAboutVerse = async (question) => {
+    const q = (question || "").trim();
+    if (!q || gitaChatLoading || !selectedScripture) return;
+    setGitaChatInput("");
+    setGitaChatLoading(true);
+    try {
+      // Broad vector search across scriptures — same retrieval used by the Guide tab
+      // and the Mahabharata chapter chat — not scoped to just this verse.
+      const relevant = await searchScriptures(q, "", 10);
+      const reranked = await rerankPassages(q, relevant, lang);
+      const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
+      console.log("RETRIEVAL CHAIN for:", JSON.stringify(q).slice(0, 80));
+      console.log("  1. Raw retrieved (" + relevant.length + "):", relevant.map(p => p.book_name).join(", "));
+      console.log("  2. After rerank (" + bestPassages.length + "):", bestPassages.map(p => p.book_name).join(", "));
+      const retrievedText = formatRetrievedPassages(bestPassages);
+
+      const systemPrompt = `You are helping a reader explore a specific verse of the Bhagavad Gita. You have two sources of context:
+
+1. CURRENT VERSE (chapter ${selectedScripture.chapter}, verse ${selectedScripture.verse_number}):
+Sanskrit: ${selectedScripture.sanskrit_text || "(not available)"}
+Transliteration: ${selectedScripture.transliteration || "(not available)"}
+Translation: ${selectedScripture.english_translation || "(not available)"}
+
+2. ADDITIONAL RELATED VERSES FROM THE GITA OR ELSEWHERE:
+${retrievedText}
+
+Answer the user's question, prioritizing the current verse for direct questions about its meaning. Use source 2 for broader thematic or cross-referential questions. When citing Bhagavad Gita verses specifically, exact chapter/verse citations (e.g. "Chapter 2, Verse 47") ARE accurate and should be used normally. For any Mahabharata or Ramayana passages that come up in source 2, do not cite exact verse/chapter numbers for those — paraphrase instead. If the question can't be answered from available context, say so honestly.`;
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...gitaChatMessages,
+        { role: "user", content: q },
+      ];
+
+      const response = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${import.meta.env.VITE_GROK_API_KEY}`,
+        },
+        body: JSON.stringify({ model: "grok-4.5", max_tokens: 700, messages }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      const answer = data.choices?.[0]?.message?.content || "";
+
+      setGitaChatMessages(prev => [...prev, { role: "user", content: q }, { role: "assistant", content: answer }]);
+
+      console.log("  3. Saved to gita_chapter_chat_history:", bestPassages.map(p => p.book_name).join(", "));
+      await supabase.from("gita_chapter_chat_history").insert({
+        device_id: deviceId,
+        chapter: selectedScripture.chapter,
+        verse_number: selectedScripture.verse_number,
+        question: q,
+        answer,
+      });
+    } catch (err) {
+      console.error("askAboutVerse failed:", err);
+      setGitaChatMessages(prev => [...prev, { role: "user", content: q }, { role: "assistant", content: "Sorry, I couldn't find an answer to that just now." }]);
+    } finally {
+      setGitaChatLoading(false);
+    }
+  };
 
   useEffect(() => {
     loadHistory(supabase, deviceId).then(setPersistentHistory);
   }, [deviceId]);
 
-  const sendMessage = async (text) => {
+  const sendMessage = async (text, queryMode = "guide") => {
     const question = text || inputText.trim();
     if (!question || isLoading) return;
     setInputText("");
@@ -981,7 +1503,7 @@ export default function DharmaApp() {
     setIsLoading(true);
 
     try {
-      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile, sessionHistory, persistentHistory);
+      const { reply, scriptures } = await askSpiritualGuide(question, selectedMood, convHistory, lang, profile, sessionHistory, persistentHistory, queryMode);
 
       const historyEntry = { question, sources: (scriptures || []).map(p => p.book_name).join(", ") || "" };
       setSessionHistory(prev => [...prev.slice(-4), historyEntry]);
@@ -1012,20 +1534,103 @@ export default function DharmaApp() {
 
   const formatTime = s => `${Math.floor(s/60).toString().padStart(2,"0")}:${(s%60).toString().padStart(2,"0")}`;
 
+  function getParvaName(book_name) {
+    const match = (book_name || "").match(/Mahabharata\s*[—–-]\s*(.+)/i);
+    return match ? match[1].trim() : (book_name || "Unknown");
+  }
+
+  // Splits chapter prose into book-style "pages" of roughly charsPerPage characters,
+  // breaking on paragraph boundaries where possible so a page never cuts mid-word.
+  function paginateChapterText(text, charsPerPage = 1400) {
+    if (!text) return [];
+    const blocks = text.split(/\n+/).filter(b => b.trim().length > 0);
+    const pages = [];
+    let current = "";
+    const pushCurrent = () => { if (current) { pages.push(current); current = ""; } };
+    for (let block of blocks) {
+      while (block.length > charsPerPage) {
+        let cut = block.lastIndexOf(' ', charsPerPage);
+        if (cut <= 0) cut = charsPerPage;
+        pushCurrent();
+        pages.push(block.slice(0, cut).trim());
+        block = block.slice(cut).trim();
+      }
+      if (current.length + block.length + 2 > charsPerPage) pushCurrent();
+      current = current ? current + "\n\n" + block : block;
+    }
+    pushCurrent();
+    return pages.length ? pages : [text];
+  }
+
+  function groupScriptures(scriptures, parvas, filterKey) {
+    const groups = [];
+
+    // Bhagavad Gita — group by chapter from loaded verses
+    if (filterKey === "all" || filterKey === "Bhagavad Gita") {
+      const gitaGroups = {};
+      for (const s of scriptures) {
+        if (!(s.book_name || "").toLowerCase().includes("bhagavad gita")) continue;
+        const key = `Bhagavad Gita — Chapter ${s.chapter}`;
+        if (!gitaGroups[key]) gitaGroups[key] = { label: key, isGita: true, entries: [], bookName: s.book_name };
+        gitaGroups[key].entries.push(s);
+      }
+      // Sort chapters numerically
+      const sorted = Object.values(gitaGroups).sort((a, b) => {
+        const na = parseInt(a.label.match(/\d+/)?.[0] || 0);
+        const nb = parseInt(b.label.match(/\d+/)?.[0] || 0);
+        return na - nb;
+      });
+      // Sort verses within each chapter
+      for (const g of sorted) {
+        g.entries.sort((a, b) =>
+          (parseInt(a.verse_number) || 0) - (parseInt(b.verse_number) || 0)
+        );
+      }
+      groups.push(...sorted);
+    }
+
+    // Mahabharata — build from distinct parva names, no verse data needed here
+    if (filterKey === "all" || filterKey === "Mahabharata") {
+      for (const bookName of parvas) {
+        if (!bookName.toLowerCase().startsWith("mahabharata")) continue;
+        const label = (() => {
+          const match = bookName.match(/Mahabharata\s*[—–-]\s*(.+)/i);
+          return match ? match[1].trim() : bookName;
+        })();
+        groups.push({ label, isGita: false, entries: [], bookName });
+      }
+    }
+
+    // Ramayana — build from distinct book names, no verse data needed here
+    if (filterKey === "all" || filterKey === "Ramayana") {
+      for (const bookName of parvas) {
+        if (!bookName.toLowerCase().startsWith("ramayana")) continue;
+        const label = (() => {
+          const match = bookName.match(/Ramayana\s*[—–-]\s*(.+)/i);
+          return match ? match[1].trim() : bookName;
+        })();
+        groups.push({ label, isGita: false, entries: [], bookName });
+      }
+    }
+
+    return groups;
+  }
+
   // Localized families
   const FAMILIES = [
-    { key: "all",           label: lang === 'hi' ? "सभी"        : "All" },
-    { key: "Bhagavad Gita", label: lang === 'hi' ? "भगवद गीता"  : "Bhagavad Gita" },
-    { key: "Mahabharata",   label: lang === 'hi' ? "महाभारत"     : "Mahabharata" },
+    { key: "Bhagavad Gita", label: lang === 'hi' ? "भगवद गीता" : "Bhagavad Gita" },
+    { key: "Mahabharata",   label: lang === 'hi' ? "महाभारत"    : "Mahabharata" },
+    { key: "Ramayana",      label: lang === 'hi' ? "रामायण"     : "Ramayana" },
   ];
 
   const filteredScriptures = dbScriptures
     .filter(s => {
       const bookName = (s.book_name || "").toLowerCase();
       const filterKey = (familyFilter || "all").toLowerCase();
-      if (filterKey === "all") return bookName.includes("bhagavad gita") || bookName.includes("mahabharata");
+      if (filterKey === "all") return bookName.includes("bhagavad gita") || bookName.includes("mahabharata") || bookName.includes("ramayana");
       if (filterKey === "bhagavad gita") return bookName.includes("bhagavad gita");
-      if (filterKey === "mahabharata") return bookName.includes("mahabharata");
+      if (filterKey === "mahabharata") return bookName.startsWith("mahabharata —");
+      if (filterKey === "ramayana") return bookName.startsWith("ramayana —");
       return false;
     })
     .filter(s => s.english_translation && s.english_translation.length > 30);
@@ -1034,6 +1639,23 @@ export default function DharmaApp() {
   const scriptureTotalPages = Math.max(1, Math.ceil(filteredScriptures.length / scripturePageSize));
   const scripturePage = Math.min(textsPage, scriptureTotalPages);
   const visibleScriptures = filteredScriptures.slice((scripturePage - 1) * scripturePageSize, scripturePage * scripturePageSize);
+  const groupedScriptures = groupScriptures(filteredScriptures, parvaList, familyFilter);
+  const parvaEntries = parvaVerses; // now loaded on demand, not derived from filteredScriptures
+
+  const versePageSize = 15;
+  const verseTotalPages = Math.max(1, Math.ceil(parvaEntries.length / versePageSize));
+  const currentVersePage = Math.min(versePage, verseTotalPages);
+  const visibleParvaEntries = parvaEntries.slice((currentVersePage - 1) * versePageSize, currentVersePage * versePageSize);
+
+  const chapterPageSize = 20;
+  const chapterTotalPages = Math.max(1, Math.ceil(chapterList.length / chapterPageSize));
+  const currentChapterPage = Math.min(chapterPage, chapterTotalPages);
+  const visibleChapters = chapterList.slice((currentChapterPage - 1) * chapterPageSize, currentChapterPage * chapterPageSize);
+
+  const readingPages = paginateChapterText(chapterText);
+  const readingTotalPages = Math.max(1, readingPages.length);
+  const currentReadingPage = Math.min(readingPage, readingTotalPages);
+  const currentReadingText = readingPages[currentReadingPage - 1] || "";
 
   useEffect(() => {
     setTextsPage(1);
@@ -1042,13 +1664,6 @@ export default function DharmaApp() {
   const now = new Date();
   const hour = now.getHours();
   const currentTimeText = now.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
-  const timeTheme = (() => {
-    if (hour >= 4 && hour < 6) return { key: "brahma", bg1: "#120914", bg2: "#1b0e2d", glow: "rgba(180,120,255,0.25)", sun: "#d9b35d" };
-    if (hour >= 6 && hour < 8) return { key: "sunrise", bg1: "#180a00", bg2: "#7d2a00", glow: "rgba(255,142,52,0.38)", sun: "#ffb84d" };
-    if (hour >= 8 && hour < 16) return { key: "day", bg1: "#081628", bg2: "#0d2a48", glow: "rgba(255,217,124,0.25)", sun: "#ffd840" };
-    if (hour >= 16 && hour < 18 + 30/60) return { key: "sunset", bg1: "#160800", bg2: "#9f3414", glow: "rgba(240,133,70,0.32)", sun: "#ffb04d" };
-    return { key: "night", bg1: "#000508", bg2: "#08101e", glow: "rgba(187,212,255,0.15)", sun: "#d4c060" };
-  })();
   const greeting = hour >= 5 && hour < 12
     ? (lang === 'hi' ? 'सुप्रभात' : 'Good morning')
     : hour >= 12 && hour < 17
@@ -1086,337 +1701,827 @@ export default function DharmaApp() {
   return (
     <>
       <style>{styles}</style>
+
       <div
-        className={`app ${timeTheme.key}`}
         style={{
-          background: `linear-gradient(180deg, ${timeTheme.bg1} 0%, ${timeTheme.bg2} 100%)`,
-          transition: 'background 0.8s ease',
+          minHeight: "100vh",
+          background: theme.bgGradient,
+          color: theme.textPrimary,
+          fontFamily: "'Inter', sans-serif",
+          position: "relative",
+          overflow: "hidden",
+          transition: "background 2s ease",
         }}
       >
-        <div className={`time-sky ${timeTheme.key}`} />
-        <div className={`time-sun ${timeTheme.key}`} />
-        <div className={`time-glow ${timeTheme.key}`} />
+        {theme.showStars && <Stars opacity={theme.starOpacity} />}
+        <Orbs theme={theme} />
+        <Birds theme={theme} />
+        <Celestial theme={theme} tab={tab} />
 
-        {/* ── Nav ── */}
-        <div className="nav">
-          <div className="nav-logo">Dharma</div>
-          <div className="nav-tabs">
-            {navItems.map(([t,l]) => (
-              <button key={t} className={`nav-tab ${tab===t?"active":""}`} onClick={() => { setTab(t); setSelectedScripture(null); }}>{l}</button>
-            ))}
-          </div>
-          <button onClick={toggleLang} style={{background:"rgba(200,140,60,0.15)",border:"0.5px solid rgba(200,140,60,0.35)",borderRadius:16,padding:"6px 12px",color:"#c88c3c",fontSize:12,cursor:"pointer",marginLeft:8}}>
-            {lang === 'en' ? 'हिं' : 'EN'}
-          </button>
-        </div>
-
-        {/* ── HOME ── */}
-        {tab === "home" && (
-          <div className="screen">
-            <div className="greeting">{`${greeting}, ${welcomeName}`}{lang === 'hi' ? '।' : '.'}</div>
-            <div className="greeting-sub">
-              <span>{new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</span>
-              <span style={{ marginLeft: 8, opacity: 0.8 }}>• {currentTimeText}</span>
-            </div>
-
-            {/* Daily shloka */}
-            <div
-              className="shloka-card"
-              onClick={() => {
-                setTab("guide");
-                setTimeout(() => {
-                  const shlokaQuestion = `Can you explain today's shloka in depth?\n${todayShloka?.verse_sanskrit || todayShloka?.sanskrit_text || ''}\n${todayShloka?.translation || todayShloka?.english_translation || ''}\nSource: ${todayShloka?.source || todayShloka?.book_name || 'Bhagavad Gita'}`;
-                  sendMessage(shlokaQuestion);
-                }, 300);
-              }}
-              style={{ cursor: 'pointer' }}
-            >
-              <div className="shloka-label">{lang === 'hi' ? 'आज का श्लोक' : "Today's shloka"}</div>
-              <div className="shloka-verse">{todayShloka.verse_sanskrit}</div>
-              <div className="shloka-transliteration">{todayShloka.transliteration}</div>
-              <div className="shloka-translation">{todayShloka.translation}</div>
-              <div className="shloka-source">— {todayShloka.source}</div>
-            </div>
-            <div style={{
-              textAlign: 'center',
-              fontSize: 11,
-              color: 'rgba(200,140,60,0.5)',
-              letterSpacing: '1px',
-              marginTop: 8,
-              fontFamily: 'Inter, sans-serif',
-            }}>
-              TAP TO EXPLORE IN GUIDE →
-            </div>
-
-            {/* Mood */}
-            <div className="section-title">{lang === 'hi' ? 'आप कैसा महसूस कर रहे हैं?' : 'How are you feeling?'}</div>
-            <div className="mood-grid">
-              {MOODS.map(m => (
-                <button key={m.value} className={`mood-btn ${selectedMood===m.value?"selected":""}`} onClick={() => setSelectedMood(prev => prev === m.value ? null : m.value)}>
-                  <span className="mood-emoji">{m.emoji}</span>
-                  <span className="mood-label">{m.label}</span>
+        <div style={{ position: "relative", zIndex: 1 }}>
+          <div className="nav" style={{ background: theme.navBg, backdropFilter: "blur(20px)", borderBottom: `0.5px solid ${theme.cardBorder}` }}>
+            <div className="nav-logo" style={{ color: theme.accent }}>Dharma</div>
+            <div className="nav-tabs" style={{ background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}>
+              {navItems.map(([t, l]) => (
+                <button
+                  key={t}
+                  className={`nav-tab ${tab === t ? "active" : ""}`}
+                  onClick={() => { setTab(t); setSelectedScripture(null); }}
+                  style={
+                    tab === t
+                      ? { background: theme.accentBg, color: theme.textPrimary, boxShadow: `0 8px 16px ${theme.navGlow}` }
+                      : { color: theme.textPrimary }
+                  }
+                >
+                  {l}
                 </button>
               ))}
             </div>
-
-            {/* Mood-matched verse */}
-            {selectedMood && (() => {
-              const match = findRelevantScriptures(selectedMood, selectedMood, 1)[0];
-              return match ? (
-                <div className="shloka-card" style={{marginBottom:20}}>
-                  <div className="shloka-label" style={{color:"#8a7a60"}}>for this feeling</div>
-                  <div className="shloka-verse" style={{fontSize:16}}>{match.verse_sanskrit}</div>
-                  <div className="shloka-translation">{match.translation}</div>
-                  <div className="shloka-source">— {match.source}</div>
-                  <button style={{marginTop:14,background:"rgba(200,140,60,0.12)",border:"0.5px solid rgba(200,140,60,0.3)",borderRadius:8,padding:"9px 16px",color:"#c88c3c",fontSize:13,cursor:"pointer",fontFamily:"Inter,sans-serif",width:"100%"}}
-                    onClick={() => { setTab("guide"); sendMessage(`I'm feeling ${selectedMood}. What does Hindu wisdom say about this?`); }}>
-                    {lang === 'hi' ? 'इस बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this →'}
-                  </button>
-                </div>
-              ) : null;
-            })()}
-
-            <div className="section-title">{lang === 'hi' ? 'अन्वेषण करें' : 'Explore'}</div>
-            <div className="quick-row">
-              <div className="quick-card" onClick={() => setTab("guide")}>
-                <span className="quick-icon">✦</span>
-                <div className="quick-name">{lang === 'hi' ? 'आध्यात्मिक मार्गदर्शक' : 'Spiritual guide'}</div>
-                <div className="quick-desc">{lang === 'hi' ? 'जीवन के सवाल पूछें और संतुलित मार्गदर्शन प्राप्त करें' : 'Ask life questions and receive grounded guidance'}</div>
-              </div>
-              <div className="quick-card" onClick={() => { setTab("guide"); sendMessage("What is my dharma? How do I find my purpose?"); }}>
-                <span className="quick-icon">❀</span>
-                <div className="quick-name">{lang === 'hi' ? 'अपना धर्म खोजें' : 'Find your dharma'}</div>
-                <div className="quick-desc">{lang === 'hi' ? 'स्पष्टता के साथ उद्देश्य और मार्ग पर चिंतन करें' : 'Reflect on purpose and path with clarity'}</div>
-              </div>
-            </div>
-
             <button
-              onClick={() => {
-                if (window.confirm('Reset all data? This clears your profile, streak, and history.')) {
-                  localStorage.removeItem('dharma_profile');
-                  localStorage.removeItem('dharma_lang');
-                  localStorage.removeItem('dharma_sadhana');
-                  localStorage.removeItem('dharma_device_id');
-                  window.location.reload();
-                }
-              }}
+              onClick={toggleLang}
               style={{
-                background: 'none',
-                border: '0.5px solid rgba(255,80,80,0.2)',
-                borderRadius: 8,
-                padding: '8px 16px',
-                color: 'rgba(255,80,80,0.4)',
-                fontSize: 11,
-                cursor: 'pointer',
-                fontFamily: 'Inter, sans-serif',
-                letterSpacing: '1px',
-                marginTop: 16,
+                background: theme.accentBg,
+                border: `0.5px solid ${theme.accentBorder}`,
+                borderRadius: 16,
+                padding: "6px 12px",
+                color: theme.accent,
+                fontSize: 12,
+                cursor: "pointer",
+                marginLeft: 8,
               }}
             >
-              ↺ Reset App Data
+              {lang === 'en' ? 'हिं' : 'EN'}
             </button>
           </div>
-        )}
 
-        {/* ── GUIDE ── */}
-        {tab === "guide" && (
-          <div className="chat-screen">
-            <div className="chat-header">
-              <div className="section-title">Spiritual guide</div>
-            </div>
+          {tab === "home" && (
+            <div className="screen" style={{ background: theme.cardBg, borderTop: `0.5px solid ${theme.cardBorder}` }}>
+              <div className="greeting" style={{ color: theme.textPrimary }}>{`${greeting}, ${welcomeName}`}{lang === 'hi' ? '।' : '.'}</div>
+              <div className="greeting-sub" style={{ color: theme.textSecondary }}>
+                <span>{new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</span>
+                <span style={{ marginLeft: 8, opacity: 0.9 }}>• {currentTimeText}</span>
+              </div>
+              <div
+                className="shloka-card"
+                onClick={() => {
+                  setTab("guide");
+                  setTimeout(() => {
+                    const shlokaQuestion = `Can you explain today's shloka in depth?\n${todayShloka?.verse_sanskrit || todayShloka?.sanskrit_text || ''}\n${todayShloka?.translation || todayShloka?.english_translation || ''}\nSource: ${todayShloka?.source || todayShloka?.book_name || 'Bhagavad Gita'}`;
+                    sendMessage(shlokaQuestion);
+                  }, 300);
+                }}
+                style={{ cursor: 'pointer', background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}
+              >
+                <div className="shloka-label">{lang === 'hi' ? 'आज का श्लोक' : "Today's shloka"}</div>
+                <div className="shloka-verse">{todayShloka.verse_sanskrit}</div>
+                <div className="shloka-transliteration">{todayShloka.transliteration}</div>
+                <div className="shloka-translation">{todayShloka.translation}</div>
+                <div className="shloka-source">— {todayShloka.source}</div>
+              </div>
 
-            <div className="chat-area">
-              {messages.length === 0 && (
-                <div className="chat-empty">
-                  <div className="chat-empty-symbol">ॐ</div>
-                  <div className="chat-empty-text">{lang === 'hi' ? 'आपके द्वारा माँगे गए उत्तर आपके भीतर पहले से ही हैं। ग्रंथ केवल मार्ग को प्रकाश देते हैं।' : 'The answers you seek are already within you. The scriptures simply light the path.'}</div>
-                  <div className="starter-grid">
-                    {starterQuestions.map(q => (
-                      <button key={q} className="starter-btn" onClick={() => sendMessage(q)}>{q}</button>
-                    ))}
+              <div style={{ textAlign: 'center', fontSize: 11, color: 'rgba(200,140,60,0.5)', letterSpacing: '1px', marginTop: 8, fontFamily: 'Inter, sans-serif' }}>
+                TAP TO EXPLORE IN GUIDE →
+              </div>
+
+              <div className="section-title">{lang === 'hi' ? 'आप कैसा महसूस कर रहे हैं?' : 'How are you feeling?'}</div>
+              <div className="mood-grid">
+                {MOODS.map(m => (
+                  <button
+                    key={m.value}
+                    className={`mood-btn ${selectedMood === m.value ? "selected" : ""}`}
+                    onClick={() => setSelectedMood(prev => prev === m.value ? null : m.value)}
+                    style={selectedMood === m.value ? { background: theme.accentBg, border: `1px solid ${theme.accentBorder}` } : { background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}
+                  >
+                    <span className="mood-emoji" style={{ color: theme.accent }}>{m.emoji}</span>
+                    <span className="mood-label" style={{ color: theme.textPrimary }}>{m.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {selectedMood && (() => {
+                const match = findRelevantScriptures(selectedMood, selectedMood, 1)[0];
+                return match ? (
+                  <div className="shloka-card" style={{ marginBottom: 20 }}>
+                    <div className="shloka-label" style={{ color: "#8a7a60" }}>for this feeling</div>
+                    <div className="shloka-verse" style={{ fontSize: 16 }}>{match.verse_sanskrit}</div>
+                    <div className="shloka-translation">{match.translation}</div>
+                    <div className="shloka-source">— {match.source}</div>
+                    <button
+                      style={{ marginTop: 14, background: "rgba(200,140,60,0.12)", border: "0.5px solid rgba(200,140,60,0.3)", borderRadius: 8, padding: "9px 16px", color: "#c88c3c", fontSize: 13, cursor: "pointer", fontFamily: "Inter,sans-serif", width: "100%" }}
+                      onClick={() => { setTab("guide"); sendMessage(`I'm feeling ${selectedMood}. What does Hindu wisdom say about this?`); }}
+                    >
+                      {lang === 'hi' ? 'इस बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this →'}
+                    </button>
                   </div>
+                ) : null;
+              })()}
+
+              <div className="section-title">{lang === 'hi' ? 'अन्वेषण करें' : 'Explore'}</div>
+              <div className="quick-row">
+                <div className="quick-card" onClick={() => setTab("guide")} style={{ background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}>
+                  <span className="quick-icon" style={{ color: theme.accent }}>✦</span>
+                  <div className="quick-name" style={{ color: theme.textPrimary }}>{lang === 'hi' ? 'आध्यात्मिक मार्गदर्शक' : 'Spiritual guide'}</div>
+                  <div className="quick-desc" style={{ color: theme.textPrimary }}>{lang === 'hi' ? 'जीवन के सवाल पूछें और संतुलित मार्गदर्शन प्राप्त करें' : 'Ask life questions and receive grounded guidance'}</div>
                 </div>
-              )}
+                <div className="quick-card" onClick={() => { setTab("guide"); sendMessage("What is my dharma? How do I find my purpose?"); }} style={{ background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}>
+                  <span className="quick-icon" style={{ color: theme.accent }}>❀</span>
+                  <div className="quick-name" style={{ color: theme.textPrimary }}>{lang === 'hi' ? 'अपना धर्म खोजें' : 'Find your dharma'}</div>
+                  <div className="quick-desc" style={{ color: theme.textPrimary }}>{lang === 'hi' ? 'स्पष्टता के साथ उद्देश्य और मार्ग पर चिंतन करें' : 'Reflect on purpose and path with clarity'}</div>
+                </div>
+              </div>
 
-              {messages.map((msg, i) => (
-                <div key={i} className={`message ${msg.type}`}>
-                  <div className={`bubble ${msg.type}`}>
-                    {msg.type === "assistant" ? <RichText text={msg.text} /> : msg.text}
-                  </div>
-                  {msg.type === 'assistant' && msg.scriptures && msg.scriptures.length > 0 && (
-                    <div style={{display:'flex', gap:8, marginTop:8, justifyContent:'center', flexWrap:'wrap'}}>
-                      {msg.scriptures.slice(0, 3).map((p, i) => (
-                        p.sanskrit_text || (p.english_translation && p.english_translation.length > 100) ? (
-                          <button
-                            key={i}
-                            onClick={() => setSharePassage(p)}
-                            style={{
-                              background: 'rgba(200,140,60,0.1)',
-                              border: '0.5px solid rgba(200,140,60,0.3)',
-                              borderRadius: 8,
-                              padding: '6px 12px',
-                              color: '#c88c3c',
-                              fontSize: 11,
-                              cursor: 'pointer',
-                              fontFamily: 'Inter, sans-serif',
-                            }}
-                          >
-                            📤 {p.book_name?.includes('Gita') ? 'Share Gita verse' : 'Share passage'}
-                          </button>
-                        ) : null
+              <button
+                onClick={() => {
+                  if (window.confirm('Reset all data? This clears your profile, streak, and history.')) {
+                    localStorage.removeItem('dharma_profile');
+                    localStorage.removeItem('dharma_lang');
+                    localStorage.removeItem('dharma_sadhana');
+                    localStorage.removeItem('dharma_device_id');
+                    window.location.reload();
+                  }
+                }}
+                style={{
+                  background: 'none',
+                  border: '0.5px solid rgba(255,80,80,0.2)',
+                  borderRadius: 8,
+                  padding: '8px 16px',
+                  color: 'rgba(255,80,80,0.4)',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                  fontFamily: 'Inter, sans-serif',
+                  letterSpacing: '1px',
+                  marginTop: 16,
+                }}
+              >
+                ↺ Reset App Data
+              </button>
+            </div>
+          )}
+
+          {tab === "guide" && (
+            <div className="chat-screen" style={{ background: theme.cardBg }}>
+              <div className="chat-header">
+                <div className="section-title" style={{ color: theme.textPrimary }}>Spiritual guide</div>
+              </div>
+
+              <div className="chat-area">
+                {messages.length === 0 && (
+                  <div className="chat-empty">
+                    <div className="chat-empty-symbol">ॐ</div>
+                    <div className="chat-empty-text">{lang === 'hi' ? 'आपके द्वारा माँगे गए उत्तर आपके भीतर पहले से ही हैं। ग्रंथ केवल मार्ग को प्रकाश देते हैं।' : 'The answers you seek are already within you. The scriptures simply light the path.'}</div>
+                    <div className="starter-grid">
+                      {starterQuestions.map(q => (
+                        <button key={q} className="starter-btn" onClick={() => sendMessage(q)}>{q}</button>
                       ))}
                     </div>
-                  )}
-                </div>
-              ))}
-
-              {isLoading && (
-                <div className="message assistant">
-                  <div className="typing-indicator">
-                    <div className="typing-dot"/><div className="typing-dot"/><div className="typing-dot"/>
                   </div>
-                </div>
-              )}
-              <div ref={chatBottomRef}/>
-            </div>
+                )}
 
-            <div className="chat-input-area">
-              <textarea className="chat-input" placeholder={lang === 'hi' ? 'अपना प्रश्न पूछें...' : 'Ask your question...'} value={inputText}
-                onChange={e => setInputText(e.target.value)}
-                onKeyDown={e => { if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();} }}
-                rows={1}
-              />
-              <button className="send-btn" onClick={()=>sendMessage()} disabled={!inputText.trim()||isLoading}>↑</button>
-            </div>
-          </div>
-        )}
-
-        {/* ── TEXTS (Scripture Browser) ── */}
-        {tab === "texts" && (
-          <div className="screen">
-            {selectedScripture ? (
-              <div className="scripture-detail">
-                <button className="back-btn" onClick={() => setSelectedScripture(null)}>{lang === 'hi' ? '← ग्रंथों पर वापस' : '← Back to texts'}</button>
-                <div className="detail-source">
-                  {selectedScripture.book_name}
-                  {selectedScripture.chapter ? ` ${selectedScripture.chapter}` : ""}
-                  {selectedScripture.verse_number ? `.${selectedScripture.verse_number}` : ""}
-                </div>
-                <div className="detail-sanskrit">{selectedScripture.sanskrit_text}</div>
-                <div className="detail-transliteration">{selectedScripture.transliteration}</div>
-                <div className="detail-translation">"{lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"</div>
-                <div className="detail-commentary-label">{lang === 'hi' ? 'टीका' : 'Commentary'}</div>
-                <div className="detail-commentary">{lang === 'hi' && selectedScripture.hindi_commentary ? selectedScripture.hindi_commentary : selectedScripture.commentary || ""}</div>
-                <button
-                  onClick={() => setSharePassage(selectedScripture)}
-                  style={{
-                    background: 'none',
-                    border: '0.5px solid rgba(200,140,60,0.2)',
-                    borderRadius: 6,
-                    padding: '4px 10px',
-                    color: 'rgba(200,140,60,0.6)',
-                    fontSize: 11,
-                    cursor: 'pointer',
-                    marginTop: 8,
-                    marginBottom: 12,
-                  }}
-                >
-                  📤 Share
-                </button>
-                <button className="ask-about-btn"
-                  onClick={() => { setTab("guide"); sendMessage(`Tell me more about this teaching from ${selectedScripture.book_name}${selectedScripture.chapter ? ` ${selectedScripture.chapter}` : ""}${selectedScripture.verse_number ? `.${selectedScripture.verse_number}` : ""}: "${lang === 'hi' && selectedScripture.hindi_translation ? selectedScripture.hindi_translation : selectedScripture.english_translation}"`); }}>
-                  {lang === 'hi' ? 'इस श्लोक के बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this verse →'}
-                </button>
-              </div>
-            ) : dbLoading ? (
-              <div style={{textAlign:"center", padding:"40px", color:"#6b5f4a", fontFamily:"'Crimson Pro',serif", fontSize:16}}>
-                Loading sacred texts...
-              </div>
-            ) : (
-              <div className="scripture-browser">
-                <div className="section-title">{lang === 'hi' ? 'पवित्र ग्रंथ' : 'Sacred texts'}</div>
-                <div className="filter-row">
-                  {FAMILIES.map(f => (
-                    <button key={f.key} className={`filter-btn ${familyFilter===f.key?"active":""}`} onClick={()=>{ setFamilyFilter(f.key); setTextsPage(1); }}>{f.label}</button>
-                  ))}
-                </div>
-                <div style={{fontSize:12,color:"#4a4030",marginBottom:8}}>{filteredScriptures.length} verses</div>
-                {visibleScriptures.map(s => (
-                  <div key={s.id} className="scripture-entry" onClick={() => setSelectedScripture(s)}>
-                    <div className="scripture-entry-source">
-                      {s.book_name}
-                      {s.chapter ? ` ${s.chapter}` : ""}
-                      {s.verse_number ? `.${s.verse_number}` : ""}
+                {messages.map((msg, i) => (
+                  <div key={i} className={`message ${msg.type}`}>
+                    <div
+                      className={`bubble ${msg.type}`}
+                      style={
+                        msg.type === "assistant"
+                          ? { background: theme.cardBg, color: theme.textPrimary, border: `0.5px solid ${theme.cardBorder}` }
+                          : undefined
+                      }
+                    >
+                      {msg.type === "assistant" ? <RichText text={msg.text} theme={theme} /> : msg.text}
                     </div>
-                    <div className="scripture-entry-verse">{s.sanskrit_text}</div>
-                    <div className="scripture-entry-translation">{lang === 'hi' && s.hindi_translation ? s.hindi_translation : s.english_translation}</div>
+                    {msg.type === 'assistant' && msg.scriptures && msg.scriptures.length > 0 && (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+                        {msg.scriptures.slice(0, 3).map((p, index) => (
+                          p.sanskrit_text || (p.english_translation && p.english_translation.length > 100) ? (
+                            <button
+                              key={index}
+                              onClick={() => setSharePassage(p)}
+                              style={{
+                                background: 'rgba(200,140,60,0.1)',
+                                border: '0.5px solid rgba(200,140,60,0.3)',
+                                borderRadius: 8,
+                                padding: '6px 12px',
+                                color: '#c88c3c',
+                                fontSize: 11,
+                                cursor: 'pointer',
+                                fontFamily: 'Inter, sans-serif',
+                              }}
+                            >
+                              📤 {p.book_name?.includes('Gita') ? 'Share Gita verse' : 'Share passage'}
+                            </button>
+                          ) : null
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {isLoading && (
+                  <div className="message assistant">
+                    <div className="typing-indicator">
+                      <div className="typing-dot" />
+                      <div className="typing-dot" />
+                      <div className="typing-dot" />
+                    </div>
+                  </div>
+                )}
+                <div ref={chatBottomRef} />
+              </div>
+
+              <div className="chat-input-area">
+                <textarea
+                  className="chat-input"
+                  placeholder={lang === 'hi' ? 'अपना प्रश्न पूछें...' : 'Ask your question...'}
+                  value={inputText}
+                  onChange={e => setInputText(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                  rows={1}
+                  style={{ background: theme.inputBg, color: theme.textPrimary, border: `0.5px solid ${theme.cardBorder}` }}
+                />
+                <button
+                  className="send-btn"
+                  onClick={() => sendMessage()}
+                  disabled={!inputText.trim() || isLoading}
+                  style={{ background: theme.accentBg, border: `0.5px solid ${theme.accentBorder}`, color: theme.accent }}
+                >
+                  ↑
+                </button>
+              </div>
+            </div>
+          )}
+
+          {tab === "texts" && (
+            <div className="screen" style={{ background: theme.cardBg }}>
+
+              {/* ── DETAIL VIEW ── */}
+              {textMode === "detail" && selectedScripture && (
+                <div className="scripture-detail">
+                  <button className="back-btn" onClick={() => { setSelectedScripture(null); setTextMode("parva"); }}>
+                    ← Back to {selectedParva}
+                  </button>
+                  <div className="detail-source">
+                    {selectedScripture.book_name}
+                    {selectedScripture.chapter ? ` · Ch ${selectedScripture.chapter}` : ""}
+                    {selectedScripture.verse_number ? ` · ${selectedScripture.verse_number}` : ""}
+                  </div>
+                  {selectedScripture.sanskrit_text && (
+                    <div className="detail-sanskrit">{selectedScripture.sanskrit_text}</div>
+                  )}
+                  {selectedScripture.transliteration && (
+                    <div className="detail-transliteration">{selectedScripture.transliteration}</div>
+                  )}
+                  <div className="detail-translation">
+                    "{lang === 'hi' && selectedScripture.hindi_translation
+                      ? selectedScripture.hindi_translation
+                      : selectedScripture.english_translation}"
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 4, marginBottom: 16 }}>
                     <button
-                      onClick={(e) => { e.stopPropagation(); setSharePassage(s); }}
-                      style={{
-                        background: 'none',
-                        border: '0.5px solid rgba(200,140,60,0.2)',
-                        borderRadius: 6,
-                        padding: '4px 10px',
-                        color: 'rgba(200,140,60,0.6)',
-                        fontSize: 11,
-                        cursor: 'pointer',
-                        marginTop: 8,
-                      }}
+                      onClick={() => setSharePassage(selectedScripture)}
+                      style={{ background: 'none', border: '0.5px solid rgba(200,140,60,0.2)', borderRadius: 6, padding: '4px 10px', color: 'rgba(200,140,60,0.6)', fontSize: 11, cursor: 'pointer' }}
                     >
                       📤 Share
                     </button>
                   </div>
-                ))}
-                {scriptureTotalPages > 1 && (
-                  <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 16, paddingBottom: 8 }}>
+                  {(selectedScripture.book_name || "").toLowerCase().includes("bhagavad gita") ? (
+                    <div style={{ marginTop: 8, borderTop: `1px solid ${theme.cardBorder}`, paddingTop: 16 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: theme.textPrimary, fontFamily: 'Inter, sans-serif', marginBottom: 10 }}>
+                        {lang === 'hi' ? 'इस श्लोक के बारे में पूछें' : 'Explore this passage'}
+                      </div>
+                      <div style={{ maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 10, paddingRight: 4 }}>
+                        {gitaChatMessages.length === 0 && !gitaChatLoading && (
+                          <div style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                            {lang === 'hi'
+                              ? 'इस श्लोक के अर्थ के बारे में पूछें, या गीता के अन्य भागों से इसका संबंध जानें।'
+                              : "Ask what this verse means, or how it connects to other themes in the Gita."}
+                          </div>
+                        )}
+                        {gitaChatMessages.map((m, i) => (
+                          <div
+                            key={i}
+                            style={{
+                              alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+                              maxWidth: '85%',
+                              background: m.role === 'user' ? 'rgba(200,140,60,0.16)' : 'rgba(0,0,0,0.28)',
+                              border: `1px solid ${theme.cardBorder}`,
+                              borderRadius: 12,
+                              padding: '8px 12px',
+                              fontSize: 13,
+                              lineHeight: 1.5,
+                              color: theme.textPrimary,
+                              fontFamily: 'Inter, sans-serif',
+                              whiteSpace: 'pre-wrap',
+                            }}
+                          >
+                            {m.content}
+                          </div>
+                        ))}
+                        {gitaChatLoading && (
+                          <div style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                            {lang === 'hi' ? 'सोच रहा हूँ…' : 'Thinking…'}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <input
+                          type="text"
+                          value={gitaChatInput}
+                          onChange={e => setGitaChatInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askAboutVerse(gitaChatInput); } }}
+                          placeholder={lang === 'hi' ? 'इस श्लोक के बारे में पूछें…' : 'Ask about this verse…'}
+                          disabled={gitaChatLoading}
+                          style={{
+                            flex: 1,
+                            background: theme.inputBg,
+                            color: theme.textPrimary,
+                            border: `0.5px solid ${theme.cardBorder}`,
+                            borderRadius: 8,
+                            padding: '8px 10px',
+                            fontSize: 13,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        />
+                        <button
+                          onClick={() => askAboutVerse(gitaChatInput)}
+                          disabled={!gitaChatInput.trim() || gitaChatLoading}
+                          style={{
+                            background: theme.accentBg,
+                            border: `0.5px solid ${theme.accentBorder}`,
+                            color: theme.accent,
+                            borderRadius: 8,
+                            padding: '8px 14px',
+                            fontSize: 13,
+                            cursor: (!gitaChatInput.trim() || gitaChatLoading) ? 'not-allowed' : 'pointer',
+                            opacity: (!gitaChatInput.trim() || gitaChatLoading) ? 0.5 : 1,
+                          }}
+                        >
+                          ↑
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
                     <button
-                      onClick={() => setTextsPage(p => Math.max(1, p - 1))}
-                      disabled={scripturePage === 1}
-                      style={{
-                        background: 'rgba(200,140,60,0.1)',
-                        border: '0.5px solid rgba(200,140,60,0.2)',
-                        borderRadius: 8,
-                        padding: '8px 12px',
-                        color: '#b6732a',
-                        cursor: scripturePage === 1 ? 'not-allowed' : 'pointer',
-                        opacity: scripturePage === 1 ? 0.5 : 1,
-                        fontFamily: 'Inter, sans-serif',
+                      className="ask-about-btn"
+                      onClick={() => {
+                        const src = selectedScripture;
+                        const ref = `${src.book_name}${src.chapter ? ` Chapter ${src.chapter}` : ""}${src.verse_number ? ` verse ${src.verse_number}` : ""}`;
+                        const translation = lang === 'hi' && src.hindi_translation ? src.hindi_translation : src.english_translation;
+                        const q = `I'm reading ${ref}. Can you tell me what is happening narratively here, what this passage is about, and what themes are present? The passage says: "${(translation || "").slice(0, 300)}"`;
+                        setTab("guide");
+                        sendMessage(q, "textual");
                       }}
                     >
-                      Prev
+                      {lang === 'hi' ? 'इस अध्याय के बारे में और जानें →' : 'Explore this passage with the guide →'}
                     </button>
-                    <span style={{ fontSize: 12, color: '#4a4030', fontFamily: 'Inter, sans-serif' }}>
-                      Page {scripturePage} / {scriptureTotalPages}
-                    </span>
-                    <button
-                      onClick={() => setTextsPage(p => Math.min(scriptureTotalPages, p + 1))}
-                      disabled={scripturePage === scriptureTotalPages}
-                      style={{
-                        background: 'rgba(200,140,60,0.1)',
-                        border: '0.5px solid rgba(200,140,60,0.2)',
-                        borderRadius: 8,
-                        padding: '8px 12px',
-                        color: '#b6732a',
-                        cursor: scripturePage === scriptureTotalPages ? 'not-allowed' : 'pointer',
-                        opacity: scripturePage === scriptureTotalPages ? 0.5 : 1,
-                        fontFamily: 'Inter, sans-serif',
-                      }}
-                    >
-                      Next
-                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* ── READING VIEW (Mahabharata chapter text) ── */}
+              {textMode === "reading" && selectedChapter && (
+                <div>
+                  <button
+                    className="back-btn"
+                    onClick={() => {
+                      setSelectedChapter(null);
+                      setChapterText("");
+                      setReadingPage(1);
+                      setTextMode("chapters");
+                    }}
+                  >
+                    ← Back to {selectedParva}
+                  </button>
+                  <div className="detail-source" style={{ marginBottom: 20 }}>
+                    {selectedParva} · Chapter {selectedChapter}
+                    {readingTotalPages > 1 ? ` · Page ${currentReadingPage} of ${readingTotalPages}` : ""}
                   </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
+                  {chapterLoading ? (
+                    <div style={{ textAlign: "center", padding: "40px", color: "#6b5f4a", fontFamily: "'Crimson Pro',serif", fontSize: 16 }}>
+                      Loading chapter...
+                    </div>
+                  ) : (
+                    <>
+                    <div
+                      style={{
+                        maxWidth: 640,
+                        minHeight: '55vh',
+                        margin: '0 auto',
+                        fontFamily: "'Crimson Pro', serif",
+                        fontSize: 18,
+                        lineHeight: 1.85,
+                        color: theme.textPrimary,
+                        whiteSpace: 'pre-wrap',
+                        paddingBottom: 24,
+                      }}
+                    >
+                      {currentReadingText || "No text available for this chapter."}
+                    </div>
+                    {readingTotalPages > 1 && (
+                      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 8, paddingBottom: 8 }}>
+                        <button
+                          onClick={() => setReadingPage(p => Math.max(1, p - 1))}
+                          disabled={currentReadingPage === 1}
+                          style={{
+                            background: 'rgba(200,140,60,0.1)',
+                            border: '0.5px solid rgba(200,140,60,0.2)',
+                            borderRadius: 8,
+                            padding: '8px 12px',
+                            color: '#b6732a',
+                            cursor: currentReadingPage === 1 ? 'not-allowed' : 'pointer',
+                            opacity: currentReadingPage === 1 ? 0.5 : 1,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        >
+                          ← Prev page
+                        </button>
+                        <span style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                          Page {currentReadingPage} / {readingTotalPages}
+                        </span>
+                        <button
+                          onClick={() => setReadingPage(p => Math.min(readingTotalPages, p + 1))}
+                          disabled={currentReadingPage === readingTotalPages}
+                          style={{
+                            background: 'rgba(200,140,60,0.1)',
+                            border: '0.5px solid rgba(200,140,60,0.2)',
+                            borderRadius: 8,
+                            padding: '8px 12px',
+                            color: '#b6732a',
+                            cursor: currentReadingPage === readingTotalPages ? 'not-allowed' : 'pointer',
+                            opacity: currentReadingPage === readingTotalPages ? 0.5 : 1,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        >
+                          Next page →
+                        </button>
+                      </div>
+                    )}
 
-        {tab === "sadhana" && (
-          <div className="screen">
-            <SadhanaTracker t={t} />
-          </div>
-        )}
+                    {/* ── ASK ABOUT THIS CHAPTER ── */}
+                    <div style={{ maxWidth: 640, margin: '24px auto 0', borderTop: `1px solid ${theme.cardBorder}`, paddingTop: 16 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: theme.textPrimary, fontFamily: 'Inter, sans-serif', marginBottom: 10 }}>
+                        {lang === 'hi' ? 'इस अध्याय के बारे में पूछें' : 'Ask about this chapter'}
+                      </div>
+                      <div style={{ maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 10, paddingRight: 4 }}>
+                        {chapterChatMessages.length === 0 && !chapterChatLoading && (
+                          <div style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                            {lang === 'hi'
+                              ? 'इस अध्याय में क्या हो रहा है, या महाभारत में कहीं और के पात्रों/घटनाओं के बारे में पूछें।'
+                              : "Ask what's happening in this chapter, or about characters and events elsewhere in the Mahabharata."}
+                          </div>
+                        )}
+                        {chapterChatMessages.map((m, i) => (
+                          <div
+                            key={i}
+                            style={{
+                              alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+                              maxWidth: '85%',
+                              background: m.role === 'user' ? 'rgba(200,140,60,0.16)' : 'rgba(0,0,0,0.28)',
+                              border: `1px solid ${theme.cardBorder}`,
+                              borderRadius: 12,
+                              padding: '8px 12px',
+                              fontSize: 13,
+                              lineHeight: 1.5,
+                              color: theme.textPrimary,
+                              fontFamily: 'Inter, sans-serif',
+                              whiteSpace: 'pre-wrap',
+                            }}
+                          >
+                            {m.content}
+                          </div>
+                        ))}
+                        {chapterChatLoading && (
+                          <div style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                            {lang === 'hi' ? 'सोच रहा हूँ…' : 'Thinking…'}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <input
+                          type="text"
+                          value={chapterChatInput}
+                          onChange={e => setChapterChatInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askAboutChapter(chapterChatInput); } }}
+                          placeholder={lang === 'hi' ? 'इस अध्याय के बारे में पूछें…' : 'Ask about this chapter…'}
+                          disabled={chapterChatLoading}
+                          style={{
+                            flex: 1,
+                            background: theme.inputBg,
+                            color: theme.textPrimary,
+                            border: `0.5px solid ${theme.cardBorder}`,
+                            borderRadius: 8,
+                            padding: '8px 10px',
+                            fontSize: 13,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        />
+                        <button
+                          onClick={() => askAboutChapter(chapterChatInput)}
+                          disabled={!chapterChatInput.trim() || chapterChatLoading}
+                          style={{
+                            background: theme.accentBg,
+                            border: `0.5px solid ${theme.accentBorder}`,
+                            color: theme.accent,
+                            borderRadius: 8,
+                            padding: '8px 14px',
+                            fontSize: 13,
+                            cursor: (!chapterChatInput.trim() || chapterChatLoading) ? 'not-allowed' : 'pointer',
+                            opacity: (!chapterChatInput.trim() || chapterChatLoading) ? 0.5 : 1,
+                          }}
+                        >
+                          ↑
+                        </button>
+                      </div>
+                    </div>
+                    </>
+                  )}
+                </div>
+              )}
 
+              {/* ── CHAPTER TILES VIEW (Mahabharata) ── */}
+              {textMode === "chapters" && selectedParva && (
+                <div>
+                  <button
+                    className="back-btn"
+                    onClick={() => {
+                      setSelectedParva(null);
+                      setSelectedParvaBookName(null);
+                      setChapterList([]);
+                      setChapterPage(1);
+                      setTextMode("browse");
+                    }}
+                  >
+                    ← Back to texts
+                  </button>
+                  <div className="detail-source" style={{ marginBottom: 20 }}>{selectedParva}</div>
+                  {chapterLoading ? (
+                    <div style={{ textAlign: "center", padding: "40px", color: "#6b5f4a", fontFamily: "'Crimson Pro',serif", fontSize: 16 }}>
+                      Loading chapters...
+                    </div>
+                  ) : (
+                    <>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: 10 }}>
+                      {visibleChapters.map(chapterNum => (
+                        <div
+                          key={chapterNum}
+                          onClick={() => {
+                            setSelectedChapter(chapterNum);
+                            setReadingPage(1);
+                            setChapterChatMessages([]);
+                            setChapterChatInput("");
+                            setTextMode("reading");
+                            loadChapterText(selectedParvaBookName, chapterNum);
+                          }}
+                          style={{
+                            background: 'rgba(0,0,0,0.32)',
+                            border: `1px solid ${theme.cardBorder}`,
+                            borderRadius: 12,
+                            padding: '14px 10px',
+                            textAlign: 'center',
+                            cursor: 'pointer',
+                            fontFamily: "'Crimson Pro', serif",
+                            fontSize: 15,
+                            fontWeight: 600,
+                            color: theme.textPrimary,
+                            backdropFilter: 'blur(10px)',
+                          }}
+                        >
+                          Chapter {chapterNum}
+                        </div>
+                      ))}
+                    </div>
+                    {chapterTotalPages > 1 && (
+                      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 16, paddingBottom: 8 }}>
+                        <button
+                          onClick={() => setChapterPage(p => Math.max(1, p - 1))}
+                          disabled={currentChapterPage === 1}
+                          style={{
+                            background: 'rgba(200,140,60,0.1)',
+                            border: '0.5px solid rgba(200,140,60,0.2)',
+                            borderRadius: 8,
+                            padding: '8px 12px',
+                            color: '#b6732a',
+                            cursor: currentChapterPage === 1 ? 'not-allowed' : 'pointer',
+                            opacity: currentChapterPage === 1 ? 0.5 : 1,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        >
+                          Prev
+                        </button>
+                        <span style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                          Page {currentChapterPage} / {chapterTotalPages}
+                        </span>
+                        <button
+                          onClick={() => setChapterPage(p => Math.min(chapterTotalPages, p + 1))}
+                          disabled={currentChapterPage === chapterTotalPages}
+                          style={{
+                            background: 'rgba(200,140,60,0.1)',
+                            border: '0.5px solid rgba(200,140,60,0.2)',
+                            borderRadius: 8,
+                            padding: '8px 12px',
+                            color: '#b6732a',
+                            cursor: currentChapterPage === chapterTotalPages ? 'not-allowed' : 'pointer',
+                            opacity: currentChapterPage === chapterTotalPages ? 0.5 : 1,
+                            fontFamily: 'Inter, sans-serif',
+                          }}
+                        >
+                          Next
+                        </button>
+                      </div>
+                    )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* ── PARVA VIEW ── */}
+              {textMode === "parva" && selectedParva && (
+                <div>
+                  <button className="back-btn" onClick={() => { setSelectedParva(null); setTextMode("browse"); }}>
+                    ← Back to texts
+                  </button>
+                  <div className="detail-source" style={{ marginBottom: 20 }}>{selectedParva}</div>
+                  {parvaLoading ? (
+                    <div style={{ textAlign: "center", padding: "40px", color: "#6b5f4a", fontFamily: "'Crimson Pro',serif", fontSize: 16 }}>
+                      Loading verses...
+                    </div>
+                  ) : (
+                  <>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {visibleParvaEntries.map(s => (
+                      <div
+                        key={s.id}
+                        className="scripture-entry"
+                        onClick={() => {
+                          setSelectedScripture(s);
+                          setGitaChatMessages([]);
+                          setGitaChatInput("");
+                          setTextMode("detail");
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        <div className="scripture-entry-source">
+                          {s.chapter ? `Ch ${s.chapter}` : ""}
+                          {s.verse_number ? ` · ${s.verse_number}` : ""}
+                        </div>
+                        {s.sanskrit_text && (
+                          <div className="scripture-entry-verse">{s.sanskrit_text.slice(0, 120)}</div>
+                        )}
+                        <div className="scripture-entry-translation">
+                          {(lang === 'hi' && s.hindi_translation
+                            ? s.hindi_translation
+                            : s.english_translation || "").slice(0, 160)}
+                          {((lang === 'hi' && s.hindi_translation
+                            ? s.hindi_translation
+                            : s.english_translation) || "").length > 160 ? "…" : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {verseTotalPages > 1 && (
+                    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 16, paddingBottom: 8 }}>
+                      <button
+                        onClick={() => setVersePage(p => Math.max(1, p - 1))}
+                        disabled={currentVersePage === 1}
+                        style={{
+                          background: 'rgba(200,140,60,0.1)',
+                          border: '0.5px solid rgba(200,140,60,0.2)',
+                          borderRadius: 8,
+                          padding: '8px 12px',
+                          color: '#b6732a',
+                          cursor: currentVersePage === 1 ? 'not-allowed' : 'pointer',
+                          opacity: currentVersePage === 1 ? 0.5 : 1,
+                          fontFamily: 'Inter, sans-serif',
+                        }}
+                      >
+                        Prev
+                      </button>
+                      <span style={{ fontSize: 12, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                        Page {currentVersePage} / {verseTotalPages}
+                      </span>
+                      <button
+                        onClick={() => setVersePage(p => Math.min(verseTotalPages, p + 1))}
+                        disabled={currentVersePage === verseTotalPages}
+                        style={{
+                          background: 'rgba(200,140,60,0.1)',
+                          border: '0.5px solid rgba(200,140,60,0.2)',
+                          borderRadius: 8,
+                          padding: '8px 12px',
+                          color: '#b6732a',
+                          cursor: currentVersePage === verseTotalPages ? 'not-allowed' : 'pointer',
+                          opacity: currentVersePage === verseTotalPages ? 0.5 : 1,
+                          fontFamily: 'Inter, sans-serif',
+                        }}
+                      >
+                        Next
+                      </button>
+                    </div>
+                  )}
+                  </>
+                  )}
+                  <button
+                    className="ask-about-btn"
+                    style={{ marginTop: 20 }}
+                    onClick={() => {
+                      const q = `I'm exploring the ${selectedParva} of the Mahabharata. Can you give me an overview of what happens in this section — the key events, characters, and themes?`;
+                      setTab("guide");
+                      sendMessage(q, "textual");
+                    }}
+                  >
+                    {lang === 'hi' ? `${selectedParva} का अवलोकन →` : `Overview of ${selectedParva} →`}
+                  </button>
+                </div>
+              )}
+
+              {/* ── BROWSE VIEW ── */}
+              {textMode === "browse" && (
+                <div className="scripture-browser">
+                  <div className="section-title">{lang === 'hi' ? 'पवित्र ग्रंथ' : 'Sacred texts'}</div>
+                  <div className="filter-row">
+                    {FAMILIES.map(f => (
+                      <button
+                        key={f.key}
+                        className={`filter-btn ${familyFilter === f.key ? "active" : ""}`}
+                        onClick={() => { setFamilyFilter(f.key); setTextsPage(1); }}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                  {dbLoading ? (
+                    <div style={{ textAlign: "center", padding: "40px", color: "#6b5f4a", fontFamily: "'Crimson Pro',serif", fontSize: 16 }}>
+                      Loading sacred texts...
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {groupedScriptures.map(group => (
+                        <div
+                          key={group.label}
+                          onClick={() => {
+                            setSelectedParva(group.label);
+                            setSelectedParvaBookName(group.bookName || null);
+                            setVersePage(1);
+                            const isMahabharata = (group.bookName || "").toLowerCase().startsWith("mahabharata");
+                            if (isMahabharata) {
+                              // Mahabharata parvas read chapter-by-chapter from book_content, not the verse list
+                              setTextMode("chapters");
+                              setChapterPage(1);
+                              loadChapters(group.bookName);
+                            } else if (!group.isGita) {
+                              // Ramayana (and any other non-Gita family) — existing verse-list behavior
+                              setTextMode("parva");
+                              loadParvaVerses(group.bookName);
+                            } else {
+                              // Gita verses already loaded — filter from dbScriptures
+                              setTextMode("parva");
+                              const chapterNum = parseInt(group.label.match(/\d+/)?.[0]);
+                              const verses = filteredScriptures
+                                .filter(s => (s.book_name || "").toLowerCase().includes("bhagavad gita")
+                                          && parseInt(s.chapter) === chapterNum)
+                                .sort((a, b) => (parseInt(a.verse_number) || 0) - (parseInt(b.verse_number) || 0));
+                              setParvaVerses(verses);
+                            }
+                          }}
+                          style={{
+                            background: 'rgba(0,0,0,0.32)',
+                            border: `1px solid ${theme.cardBorder}`,
+                            borderRadius: 14,
+                            padding: '16px 18px',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: 12,
+                            backdropFilter: 'blur(10px)',
+                            transition: 'border-color 0.15s',
+                          }}
+                        >
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 15, fontWeight: 600, color: theme.textPrimary, fontFamily: "'Crimson Pro', serif", marginBottom: 4 }}>
+                              {group.label}
+                            </div>
+                            {group.isGita && (
+                              <div style={{ fontSize: 11, color: theme.textMuted, fontFamily: 'Inter, sans-serif' }}>
+                                {group.entries.length} {group.entries.length === 1 ? 'verse' : 'verses'}
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ color: theme.accent, fontSize: 18, opacity: 0.7 }}>›</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+            </div>
+          )}
+
+          {tab === "sadhana" && (
+            <div className="screen">
+              <SadhanaTracker t={t} />
+            </div>
+          )}
+        </div>
       </div>
 
       {sharePassage && (
