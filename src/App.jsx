@@ -1,11 +1,13 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
-import { createClient } from "@supabase/supabase-js";
+import { createPortal } from "react-dom";
 import OpenAI from "openai";
 import Onboarding from "./Onboarding.jsx";
 import SadhanaTracker from "./SadhanaTracker.jsx";
 import ShareCard from "./ShareCard.jsx";
-import { SCRIPTURES, findRelevantScriptures } from "./scriptures.js";
+import Auth from "./Auth.jsx";
+import { useAuth } from "./useAuth.js";
 import { useTimeTheme } from './useTimeTheme.js';
+import { supabase } from "./supabaseClient.js";
 
 // ── DEV MODE — set to false before pushing to production ──
 const DEV_MODE = false;
@@ -36,21 +38,17 @@ const DEV_RESPONSE = {
   ]
 };
 
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-);
-
 const openaiClient = new OpenAI({
   apiKey: import.meta.env.VITE_OPENAI_API_KEY,
   dangerouslyAllowBrowser: true,
 });
 
-async function saveToHistory(supabaseClient, deviceId, question, answer, passages, mood) {
+async function saveToHistory(supabaseClient, deviceId, question, answer, passages, mood, userId) {
   try {
     console.log("  3. Saved to conversation_history:", passages.map(p => p.book_name).join(", "));
     await supabaseClient.from("conversation_history").insert({
       device_id: deviceId,
+      user_id: userId || null,
       question: question.slice(0, 800),
       answer: answer.slice(0, 2500),
       sources: passages.map(p => p.book_name).join(", "),
@@ -79,7 +77,7 @@ async function loadHistory(supabaseClient, deviceId) {
   }
 }
 
-async function searchScriptures(query, mood = "", maxResults = 10) {
+async function searchScriptures(query, mood = "", maxResults = 10, bookHint = null) {
   const searchText = mood ? `${query} feeling ${mood}` : query;
 
   try {
@@ -89,16 +87,10 @@ async function searchScriptures(query, mood = "", maxResults = 10) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    const q = (query + " " + mood).toLowerCase();
-    const mentionsGita = q.includes("gita") || q.includes("bhagavad") ||
-                         q.includes("krishna") || q.includes("arjuna");
-    const mentionsMB   = q.includes("mahabharata") || q.includes("mahabharat") ||
-                         q.includes("parva");
-
     let results = [];
 
-    if (mentionsGita && !mentionsMB) {
-      // Search ONLY within Bhagavad Gita — fast because pre-filtered
+    if (bookHint === "gita") {
+      // Caller already knows the scope — skip keyword guessing entirely
       const { data, error } = await supabase.rpc("match_scriptures_filtered", {
         query_embedding: queryEmbedding,
         filter_book:     "Bhagavad Gita",
@@ -107,10 +99,9 @@ async function searchScriptures(query, mood = "", maxResults = 10) {
       });
       if (error) console.error("Gita search error:", error);
       results = data || [];
-      console.log("Gita-only search:", results.length, "results");
+      console.log("Gita-only search (hinted):", results.length, "results");
 
-    } else if (mentionsMB && !mentionsGita) {
-      // Search ONLY within Mahabharata English (not Critical Edition)
+    } else if (bookHint === "mahabharata") {
       const { data, error } = await supabase.rpc("match_scriptures_filtered", {
         query_embedding: queryEmbedding,
         filter_book:     "Mahabharata —",
@@ -119,19 +110,51 @@ async function searchScriptures(query, mood = "", maxResults = 10) {
       });
       if (error) console.error("MB search error:", error);
       results = data || [];
-      console.log("Mahabharata search:", results.length, "results");
+      console.log("Mahabharata search (hinted):", results.length, "results");
 
     } else {
-      // General emotional/philosophical query
-      // Use combined function that pre-filters to Gita + Mahabharata English only
-      const { data, error } = await supabase.rpc("match_scriptures_combined", {
-        query_embedding: queryEmbedding,
-        match_threshold: 0.2,
-        match_count:     10,
-      });
-      if (error) console.error("Combined search error:", error);
-      results = data || [];
-      console.log("Combined search:", results.length, "results");
+      const q = (query + " " + mood).toLowerCase();
+      const mentionsGita = q.includes("gita") || q.includes("bhagavad") ||
+                           q.includes("krishna") || q.includes("arjuna");
+      const mentionsMB   = q.includes("mahabharata") || q.includes("mahabharat") ||
+                           q.includes("parva");
+
+      if (mentionsGita && !mentionsMB) {
+        // Search ONLY within Bhagavad Gita — fast because pre-filtered
+        const { data, error } = await supabase.rpc("match_scriptures_filtered", {
+          query_embedding: queryEmbedding,
+          filter_book:     "Bhagavad Gita",
+          match_threshold: 0.2,
+          match_count:     10,
+        });
+        if (error) console.error("Gita search error:", error);
+        results = data || [];
+        console.log("Gita-only search:", results.length, "results");
+
+      } else if (mentionsMB && !mentionsGita) {
+        // Search ONLY within Mahabharata English (not Critical Edition)
+        const { data, error } = await supabase.rpc("match_scriptures_filtered", {
+          query_embedding: queryEmbedding,
+          filter_book:     "Mahabharata —",
+          match_threshold: 0.2,
+          match_count:     10,
+        });
+        if (error) console.error("MB search error:", error);
+        results = data || [];
+        console.log("Mahabharata search:", results.length, "results");
+
+      } else {
+        // General emotional/philosophical query
+        // Use combined function that pre-filters to Gita + Mahabharata English only
+        const { data, error } = await supabase.rpc("match_scriptures_combined", {
+          query_embedding: queryEmbedding,
+          match_threshold: 0.2,
+          match_count:     10,
+        });
+        if (error) console.error("Combined search error:", error);
+        results = data || [];
+        console.log("Combined search:", results.length, "results");
+      }
     }
 
     if (results.length === 0) {
@@ -1182,7 +1205,43 @@ export default function DharmaApp() {
   const [persistentHistory, setPersistentHistory] = useState([]);
   const [dbScriptures, setDbScriptures] = useState([]);
   const [dbLoading, setDbLoading] = useState(true);
-  const [todayShloka] = useState(() => SCRIPTURES[new Date().getDate() % SCRIPTURES.length]);
+  const [todayShloka, setTodayShloka] = useState(null);
+  const [moodShloka, setMoodShloka] = useState(null);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const [accountMenuPos, setAccountMenuPos] = useState(null);
+  const accountBtnRef = useRef(null);
+
+  const { user, loading: authLoading, requestOtp, verifyOtpAndLogin, logout, clearMyHistory } = useAuth();
+
+  // Today's home-card shloka — deterministic pick from the shlokas table
+  // so it's stable across reloads within the same day, no mood filter.
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase
+        .from("shlokas")
+        .select("*")
+        .eq("is_active", true);
+      if (data && data.length > 0) {
+        const idx = new Date().getDate() % data.length;
+        setTodayShloka(data[idx]);
+      }
+    })();
+  }, []);
+
+  // Mood-matched shloka — refetched whenever selectedMood changes,
+  // filtered by mood_tags overlap.
+  useEffect(() => {
+    if (!selectedMood) { setMoodShloka(null); return; }
+    (async () => {
+      const { data } = await supabase
+        .from("shlokas")
+        .select("*")
+        .eq("is_active", true)
+        .contains("mood_tags", [selectedMood])
+        .limit(1);
+      setMoodShloka(data && data.length > 0 ? data[0] : null);
+    })();
+  }, [selectedMood]);
 
   const deviceId = useMemo(() => {
     let id = localStorage.getItem("dharma_device_id");
@@ -1373,10 +1432,11 @@ export default function DharmaApp() {
     try {
       // Broad vector search across scriptures — same retrieval used by the Guide tab,
       // not scoped to the current parva, since the reader may ask about anything.
-      const relevant = await searchScriptures(q, "", 10);
+      const relevant = await searchScriptures(q, "", 10, "mahabharata");
       const reranked = await rerankPassages(q, relevant, lang);
       const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
       console.log("RETRIEVAL CHAIN for:", JSON.stringify(q).slice(0, 80));
+      console.log("  0. Current chapter always included:", selectedParvaBookName, "ch.", selectedChapter, `(${chapterText.length} chars)`);
       console.log("  1. Raw retrieved (" + relevant.length + "):", relevant.map(p => p.book_name).join(", "));
       console.log("  2. After rerank (" + bestPassages.length + "):", bestPassages.map(p => p.book_name).join(", "));
       const retrievedText = formatRetrievedPassages(bestPassages);
@@ -1414,10 +1474,12 @@ Answer using whichever source(s) are relevant. Prioritize source 1 for questions
       console.log("  3. Saved to mahabharata_chapter_chat_history:", bestPassages.map(p => p.book_name).join(", "));
       await supabase.from("mahabharata_chapter_chat_history").insert({
         device_id: deviceId,
+        user_id: user?.id || null,
         book_name: selectedParvaBookName,
         chapter: selectedChapter,
         question: q,
         answer,
+        sources: bestPassages.map(p => p.book_name).join(", "),
       });
     } catch (err) {
       console.error("askAboutChapter failed:", err);
@@ -1435,10 +1497,11 @@ Answer using whichever source(s) are relevant. Prioritize source 1 for questions
     try {
       // Broad vector search across scriptures — same retrieval used by the Guide tab
       // and the Mahabharata chapter chat — not scoped to just this verse.
-      const relevant = await searchScriptures(q, "", 10);
+      const relevant = await searchScriptures(q, "", 10, "gita");
       const reranked = await rerankPassages(q, relevant, lang);
       const bestPassages = reranked.length > 0 ? reranked : relevant.slice(0, 5);
       console.log("RETRIEVAL CHAIN for:", JSON.stringify(q).slice(0, 80));
+      console.log("  0. Current verse always included: ch.", selectedScripture.chapter, "v.", selectedScripture.verse_number);
       console.log("  1. Raw retrieved (" + relevant.length + "):", relevant.map(p => p.book_name).join(", "));
       console.log("  2. After rerank (" + bestPassages.length + "):", bestPassages.map(p => p.book_name).join(", "));
       const retrievedText = formatRetrievedPassages(bestPassages);
@@ -1478,10 +1541,12 @@ Answer the user's question, prioritizing the current verse for direct questions 
       console.log("  3. Saved to gita_chapter_chat_history:", bestPassages.map(p => p.book_name).join(", "));
       await supabase.from("gita_chapter_chat_history").insert({
         device_id: deviceId,
+        user_id: user?.id || null,
         chapter: selectedScripture.chapter,
         verse_number: selectedScripture.verse_number,
         question: q,
         answer,
+        sources: bestPassages.map(p => p.book_name).join(", "),
       });
     } catch (err) {
       console.error("askAboutVerse failed:", err);
@@ -1507,7 +1572,7 @@ Answer the user's question, prioritizing the current verse for direct questions 
 
       const historyEntry = { question, sources: (scriptures || []).map(p => p.book_name).join(", ") || "" };
       setSessionHistory(prev => [...prev.slice(-4), historyEntry]);
-      saveToHistory(supabase, deviceId, question, reply, scriptures || [], selectedMood);
+      saveToHistory(supabase, deviceId, question, reply, scriptures || [], selectedMood, user?.id);
 
       const assistantMessage = {
         type: "assistant",
@@ -1737,22 +1802,124 @@ Answer the user's question, prioritizing the current verse for direct questions 
                 </button>
               ))}
             </div>
-            <button
-              onClick={toggleLang}
-              style={{
-                background: theme.accentBg,
-                border: `0.5px solid ${theme.accentBorder}`,
-                borderRadius: 16,
-                padding: "6px 12px",
-                color: theme.accent,
-                fontSize: 12,
-                cursor: "pointer",
-                marginLeft: 8,
-              }}
-            >
-              {lang === 'en' ? 'हिं' : 'EN'}
-            </button>
+            <div style={{ position: "relative", marginLeft: 8 }}>
+              <button
+                ref={accountBtnRef}
+                onClick={() => {
+                  if (!showAccountMenu && accountBtnRef.current) {
+                    const rect = accountBtnRef.current.getBoundingClientRect();
+                    setAccountMenuPos({ top: rect.bottom + 8, right: window.innerWidth - rect.right });
+                  }
+                  setShowAccountMenu(prev => !prev);
+                }}
+                style={{
+                  background: theme.accentBg,
+                  border: `0.5px solid ${theme.accentBorder}`,
+                  borderRadius: "50%",
+                  width: 32,
+                  height: 32,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: theme.accent,
+                  fontSize: 14,
+                  cursor: "pointer",
+                }}
+                aria-label="Account menu"
+              >
+                {user ? (user.name || "U").charAt(0).toUpperCase() : "☰"}
+              </button>
+
+              {showAccountMenu && accountMenuPos && createPortal(
+                <>
+                  <div
+                    onClick={() => setShowAccountMenu(false)}
+                    style={{ position: "fixed", inset: 0, zIndex: 1000 }}
+                  />
+                  <div
+                    style={{
+                      position: "fixed",
+                      top: accountMenuPos.top,
+                      right: accountMenuPos.right,
+                      background: theme.cardBg,
+                      border: `1px solid ${theme.cardBorder}`,
+                      borderRadius: 12,
+                      padding: 12,
+                      minWidth: 200,
+                      zIndex: 1001,
+                      boxShadow: "0 12px 28px rgba(0,0,0,0.35)",
+                      backdropFilter: "blur(16px)",
+                    }}
+                  >
+                    {user ? (
+                      <>
+                        <div style={{ fontSize: 12, color: theme.textSecondary, padding: "4px 6px 10px", fontFamily: "Inter, sans-serif" }}>
+                          {lang === 'hi' ? 'साइन इन:' : 'Signed in as'} <strong style={{ color: theme.textPrimary }}>{user.name}</strong>
+                        </div>
+                        <button
+                          onClick={async () => {
+                            if (window.confirm(lang === 'hi' ? 'लॉग आउट करें?' : 'Log out?')) {
+                              await logout();
+                              setShowAccountMenu(false);
+                            }
+                          }}
+                          style={{
+                            width: "100%", textAlign: "left", background: "none", border: "none",
+                            color: theme.textPrimary, fontSize: 13, padding: "8px 6px", cursor: "pointer",
+                            fontFamily: "Inter, sans-serif", borderRadius: 8,
+                          }}
+                        >
+                          {lang === 'hi' ? 'लॉग आउट' : 'Log out'}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => { setTab("account"); setShowAccountMenu(false); }}
+                        style={{
+                          width: "100%", textAlign: "left", background: "none", border: "none",
+                          color: theme.textPrimary, fontSize: 13, padding: "8px 6px", cursor: "pointer",
+                          fontFamily: "Inter, sans-serif", borderRadius: 8,
+                        }}
+                      >
+                        {lang === 'hi' ? 'साइन इन करें' : 'Sign in'}
+                      </button>
+                    )}
+
+                    <div style={{ borderTop: `0.5px solid ${theme.cardBorder}`, marginTop: 8, paddingTop: 8 }}>
+                      <button
+                        onClick={toggleLang}
+                        style={{
+                          width: "100%", textAlign: "left", background: "none", border: "none",
+                          color: theme.textSecondary, fontSize: 13, padding: "8px 6px", cursor: "pointer",
+                          fontFamily: "Inter, sans-serif", borderRadius: 8,
+                        }}
+                      >
+                        {lang === 'en' ? 'हिंदी में बदलें' : 'Switch to English'}
+                      </button>
+                    </div>
+                  </div>
+                </>,
+                document.body
+              )}
+            </div>
           </div>
+
+          {tab === "account" && (
+            <div className="screen" style={{ background: theme.cardBg, borderTop: `0.5px solid ${theme.cardBorder}` }}>
+              {!user && !authLoading ? (
+                <Auth
+                  requestOtp={requestOtp}
+                  verifyOtpAndLogin={verifyOtpAndLogin}
+                  onSuccess={() => setTab("sadhana")}
+                  lang={lang}
+                />
+              ) : (
+                <div style={{ padding: 20, textAlign: "center", color: theme.textSecondary, fontFamily: "Inter, sans-serif" }}>
+                  {lang === 'hi' ? `आप ${user?.name} के रूप में साइन इन हैं।` : `You're signed in as ${user?.name}.`}
+                </div>
+              )}
+            </div>
+          )}
 
           {tab === "home" && (
             <div className="screen" style={{ background: theme.cardBg, borderTop: `0.5px solid ${theme.cardBorder}` }}>
@@ -1761,27 +1928,31 @@ Answer the user's question, prioritizing the current verse for direct questions 
                 <span>{new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}</span>
                 <span style={{ marginLeft: 8, opacity: 0.9 }}>• {currentTimeText}</span>
               </div>
-              <div
-                className="shloka-card"
-                onClick={() => {
-                  setTab("guide");
-                  setTimeout(() => {
-                    const shlokaQuestion = `Can you explain today's shloka in depth?\n${todayShloka?.verse_sanskrit || todayShloka?.sanskrit_text || ''}\n${todayShloka?.translation || todayShloka?.english_translation || ''}\nSource: ${todayShloka?.source || todayShloka?.book_name || 'Bhagavad Gita'}`;
-                    sendMessage(shlokaQuestion);
-                  }, 300);
-                }}
-                style={{ cursor: 'pointer', background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}
-              >
-                <div className="shloka-label">{lang === 'hi' ? 'आज का श्लोक' : "Today's shloka"}</div>
-                <div className="shloka-verse">{todayShloka.verse_sanskrit}</div>
-                <div className="shloka-transliteration">{todayShloka.transliteration}</div>
-                <div className="shloka-translation">{todayShloka.translation}</div>
-                <div className="shloka-source">— {todayShloka.source}</div>
-              </div>
+              {todayShloka && (
+                <>
+                  <div
+                    className="shloka-card"
+                    onClick={() => {
+                      setTab("guide");
+                      setTimeout(() => {
+                        const shlokaQuestion = `Can you explain today's shloka in depth?\n${todayShloka.sanskrit_text || ''}\n${todayShloka.translation || ''}\nSource: ${todayShloka.source || 'Bhagavad Gita'}`;
+                        sendMessage(shlokaQuestion);
+                      }, 300);
+                    }}
+                    style={{ cursor: 'pointer', background: theme.cardBg, border: `1px solid ${theme.cardBorder}` }}
+                  >
+                    <div className="shloka-label">{lang === 'hi' ? 'आज का श्लोक' : "Today's shloka"}</div>
+                    <div className="shloka-verse">{todayShloka.sanskrit_text}</div>
+                    <div className="shloka-transliteration">{todayShloka.transliteration}</div>
+                    <div className="shloka-translation">{todayShloka.translation}</div>
+                    <div className="shloka-source">— {todayShloka.source}</div>
+                  </div>
 
-              <div style={{ textAlign: 'center', fontSize: 11, color: 'rgba(200,140,60,0.5)', letterSpacing: '1px', marginTop: 8, fontFamily: 'Inter, sans-serif' }}>
-                TAP TO EXPLORE IN GUIDE →
-              </div>
+                  <div style={{ textAlign: 'center', fontSize: 11, color: 'rgba(200,140,60,0.5)', letterSpacing: '1px', marginTop: 8, fontFamily: 'Inter, sans-serif' }}>
+                    TAP TO EXPLORE IN GUIDE →
+                  </div>
+                </>
+              )}
 
               <div className="section-title">{lang === 'hi' ? 'आप कैसा महसूस कर रहे हैं?' : 'How are you feeling?'}</div>
               <div className="mood-grid">
@@ -1798,23 +1969,20 @@ Answer the user's question, prioritizing the current verse for direct questions 
                 ))}
               </div>
 
-              {selectedMood && (() => {
-                const match = findRelevantScriptures(selectedMood, selectedMood, 1)[0];
-                return match ? (
-                  <div className="shloka-card" style={{ marginBottom: 20 }}>
-                    <div className="shloka-label" style={{ color: "#8a7a60" }}>for this feeling</div>
-                    <div className="shloka-verse" style={{ fontSize: 16 }}>{match.verse_sanskrit}</div>
-                    <div className="shloka-translation">{match.translation}</div>
-                    <div className="shloka-source">— {match.source}</div>
-                    <button
-                      style={{ marginTop: 14, background: "rgba(200,140,60,0.12)", border: "0.5px solid rgba(200,140,60,0.3)", borderRadius: 8, padding: "9px 16px", color: "#c88c3c", fontSize: 13, cursor: "pointer", fontFamily: "Inter,sans-serif", width: "100%" }}
-                      onClick={() => { setTab("guide"); sendMessage(`I'm feeling ${selectedMood}. What does Hindu wisdom say about this?`); }}
-                    >
-                      {lang === 'hi' ? 'इस बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this →'}
-                    </button>
-                  </div>
-                ) : null;
-              })()}
+              {selectedMood && moodShloka && (
+                <div className="shloka-card" style={{ marginBottom: 20 }}>
+                  <div className="shloka-label" style={{ color: "#8a7a60" }}>for this feeling</div>
+                  <div className="shloka-verse" style={{ fontSize: 16 }}>{moodShloka.sanskrit_text}</div>
+                  <div className="shloka-translation">{moodShloka.translation}</div>
+                  <div className="shloka-source">— {moodShloka.source}</div>
+                  <button
+                    style={{ marginTop: 14, background: "rgba(200,140,60,0.12)", border: "0.5px solid rgba(200,140,60,0.3)", borderRadius: 8, padding: "9px 16px", color: "#c88c3c", fontSize: 13, cursor: "pointer", fontFamily: "Inter,sans-serif", width: "100%" }}
+                    onClick={() => { setTab("guide"); sendMessage(`I'm feeling ${selectedMood}. What does Hindu wisdom say about this?`); }}
+                  >
+                    {lang === 'hi' ? 'इस बारे में मार्गदर्शक से पूछें →' : 'Ask the guide about this →'}
+                  </button>
+                </div>
+              )}
 
               <div className="section-title">{lang === 'hi' ? 'अन्वेषण करें' : 'Explore'}</div>
               <div className="quick-row">
@@ -2518,7 +2686,27 @@ Answer the user's question, prioritizing the current verse for direct questions 
 
           {tab === "sadhana" && (
             <div className="screen">
-              <SadhanaTracker t={t} />
+              {!user && !authLoading ? (
+                <div style={{ textAlign: "center", padding: "60px 24px", color: theme.textSecondary, fontFamily: "Inter, sans-serif" }}>
+                  <div style={{ fontSize: 14, marginBottom: 16 }}>
+                    {lang === 'hi'
+                      ? 'अपनी साधना को ट्रैक करने के लिए साइन इन करें।'
+                      : 'Sign in to track your daily practice.'}
+                  </div>
+                  <button
+                    onClick={() => setTab("account")}
+                    style={{
+                      background: theme.accentBg, border: `0.5px solid ${theme.accentBorder}`,
+                      borderRadius: 24, padding: "12px 28px", color: theme.accent,
+                      fontSize: 14, cursor: "pointer", fontFamily: "Inter, sans-serif",
+                    }}
+                  >
+                    {lang === 'hi' ? 'साइन इन करें' : 'Sign in'}
+                  </button>
+                </div>
+              ) : (
+                <SadhanaTracker user={user} />
+              )}
             </div>
           )}
         </div>
