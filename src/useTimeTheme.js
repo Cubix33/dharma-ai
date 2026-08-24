@@ -2,15 +2,12 @@ import * as React from "react";
 
 // useTimeTheme.js — Time-based spiritual themes for Dharma AI
 
-export function getTimeTheme() {
-    return THEMES.night
+export function getTimeTheme(override) {
+  if (override && THEMES[override]) return THEMES[override];
+
   const hour = new Date().getHours();
   const min  = new Date().getMinutes();
   const time = hour + min / 60;
-
-  // Temporary preview test — uncomment to force a specific theme
-  // if (time >= 4 && time < 6) return THEMES.brahma;
-  // return THEMES.sunrise;
 
   if (time >= 4 && time < 6) return THEMES.brahma;
   if (time >= 6 && time < 8) return THEMES.sunrise;
@@ -20,15 +17,25 @@ export function getTimeTheme() {
 }
 
 export function useTimeTheme() {
-  const [theme, setTheme] = React.useState(getTimeTheme());
+  const [override, setOverride] = React.useState(localStorage.getItem('spiritualAtmosphere') || 'auto');
+  const [theme, setTheme] = React.useState(getTimeTheme(override === 'auto' ? null : override));
+
   React.useEffect(() => {
-    const interval = setInterval(() => setTheme(getTimeTheme()), 60000);
+    const updateTheme = () => setTheme(getTimeTheme(override === 'auto' ? null : override));
+    updateTheme();
+    const interval = setInterval(updateTheme, 60000);
     return () => clearInterval(interval);
-  }, []);
-  return theme;
+  }, [override]);
+
+  const changeTheme = (newTheme) => {
+    setOverride(newTheme);
+    localStorage.setItem('spiritualAtmosphere', newTheme);
+  };
+
+  return { theme, override, changeTheme };
 }
 
-const THEMES = {
+export const THEMES = {
 
   brahma: {
     name: "Brahma Muhurta",

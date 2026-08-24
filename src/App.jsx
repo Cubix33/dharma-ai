@@ -1197,7 +1197,7 @@ export default function DharmaApp() {
     setProfile(nextProfile);
   };
 
-  const theme = useTimeTheme();
+  const { theme, override, changeTheme } = useTimeTheme();
   const [tab, setTab] = useState("home");
   const [selectedMood, setSelectedMood] = useState(null);
   const [sharePassage, setSharePassage] = useState(null);
@@ -1886,16 +1886,41 @@ Answer the user's question, prioritizing the current verse for direct questions 
                     )}
 
                     <div style={{ borderTop: `0.5px solid ${theme.cardBorder}`, marginTop: 8, paddingTop: 8 }}>
-                      <button
-                        onClick={toggleLang}
-                        style={{
-                          width: "100%", textAlign: "left", background: "none", border: "none",
-                          color: theme.textSecondary, fontSize: 13, padding: "8px 6px", cursor: "pointer",
-                          fontFamily: "Inter, sans-serif", borderRadius: 8,
-                        }}
-                      >
-                        {lang === 'en' ? 'हिंदी में बदलें' : 'Switch to English'}
-                      </button>
+                      <div style={{ padding: "8px 6px", fontFamily: "Inter, sans-serif" }}>
+                        <div style={{ fontSize: 11, color: theme.textSecondary, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                          {lang === 'hi' ? 'आध्यात्मिक वातावरण' : 'Spiritual Atmosphere'}
+                        </div>
+                        <select 
+                          value={override} 
+                          onChange={(e) => changeTheme(e.target.value)}
+                          style={{
+                            width: "100%", background: "rgba(0,0,0,0.2)", border: `1px solid ${theme.cardBorder}`,
+                            color: theme.textPrimary, padding: "6px 8px", borderRadius: 6, fontSize: 13,
+                            fontFamily: "Inter, sans-serif", outline: "none", cursor: "pointer",
+                            appearance: "none", WebkitAppearance: "none"
+                          }}
+                        >
+                          <option value="auto" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'स्वचालित (वास्तविक समय)' : 'Auto (Real-time)'}</option>
+                          <option value="brahma" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'ब्रह्म मुहूर्त' : 'Brahma Muhurta'}</option>
+                          <option value="sunrise" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'उषाकाल' : 'Sunrise (उषाकाल)'}</option>
+                          <option value="day" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'दिवस' : 'Day (दिवस)'}</option>
+                          <option value="sunset" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'सन्ध्या' : 'Sunset (सन्ध्या)'}</option>
+                          <option value="night" style={{ background: "#000", color: "#fff" }}>{lang === 'hi' ? 'रात्रि' : 'Night (रात्रि)'}</option>
+                        </select>
+                      </div>
+                      
+                      <div style={{ borderTop: `0.5px solid ${theme.cardBorder}`, marginTop: 8, paddingTop: 8 }}>
+                        <button
+                          onClick={toggleLang}
+                          style={{
+                            width: "100%", textAlign: "left", background: "none", border: "none",
+                            color: theme.textSecondary, fontSize: 13, padding: "8px 6px", cursor: "pointer",
+                            fontFamily: "Inter, sans-serif", borderRadius: 8,
+                          }}
+                        >
+                          {lang === 'en' ? '🇮🇳 हिंदी में बदलें' : 'Switch to English'}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </>,
