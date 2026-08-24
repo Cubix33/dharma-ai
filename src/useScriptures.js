@@ -2,17 +2,18 @@
 // Replaces findRelevantScriptures() with real Supabase vector search
 // Import this in App.jsx instead of calling findRelevantScriptures directly
 
+import React, { useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { OpenAI } from "openai";
 
 // ── Clients ────────────────────────────────────────────────────────────────
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-);
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || "https://placeholder-dharma.supabase.co";
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || "placeholder-anon-key";
+
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const openai = new OpenAI({
-  apiKey: import.meta.env.VITE_OPENAI_API_KEY,
+  apiKey: import.meta.env.VITE_OPENAI_API_KEY || "placeholder-key",
   dangerouslyAllowBrowser: true, // safe for read-only embedding calls
 });
 
